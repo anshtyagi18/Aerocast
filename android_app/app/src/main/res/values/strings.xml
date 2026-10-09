@@ -1,0 +1,10 @@
+<resources>
+    <string name="app_name">AeroCast</string>
+    <string name="tagline">Huawei Air-Gesture High Speed Transfer</string>
+    <string name="status_standby">Listening for AeroCast beacons on LAN…</string>
+    <string name="pick_file_button">Select File to Cast</string>
+    <string name="hud_in_air">File in Air</string>
+    <string name="hud_prompt_grab">Make Fist (✊) to Cast</string>
+    <string name="hud_prompt_drop">Open Palm (✋) to Receive</string>
+    <string name="success_title">Dropped Successfully!</string>
+</resources>

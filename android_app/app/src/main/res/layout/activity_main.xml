@@ -1,0 +1,277 @@
+<?xml version="1.0" encoding="utf-8"?>
+<androidx.constraintlayout.widget.ConstraintLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="#070A12"
+    android:padding="20dp">
+
+    <!-- TOP FLOATING DYNAMIC CAPSULE (HUAWEI AIR-TRANSFER PILL) -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/dynamicCapsule"
+        android:layout_width="0dp"
+        android:layout_height="56dp"
+        android:layout_marginTop="12dp"
+        android:background="@drawable/bg_capsule"
+        android:elevation="12dp"
+        android:paddingHorizontal="16dp"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent"
+        tools:visibility="visible">
+
+        <TextView
+            android:id="@+id/capsuleIcon"
+            android:layout_width="32dp"
+            android:layout_height="32dp"
+            android:background="#2E38BDF8"
+            android:gravity="center"
+            android:text="✊"
+            android:textColor="#38BDF8"
+            android:textSize="16sp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:layout_marginEnd="8dp"
+            android:orientation="vertical"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toStartOf="@id/capsuleBadge"
+            app:layout_constraintStart_toEndOf="@id/capsuleIcon"
+            app:layout_constraintTop_toTopOf="parent">
+
+            <TextView
+                android:id="@+id/capsuleTitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="File in Air"
+                android:textColor="#F8FAFC"
+                android:textSize="13sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/capsuleSubtitle"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Open Palm (✋) to Receive"
+                android:textColor="#94A3B8"
+                android:textSize="11sp" />
+        </LinearLayout>
+
+        <TextView
+            android:id="@+id/capsuleBadge"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="•••"
+            android:textColor="#38BDF8"
+            android:textSize="12sp"
+            android:textStyle="bold"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <!-- HEADER / BRANDING -->
+    <LinearLayout
+        android:id="@+id/headerLayout"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="64dp"
+        android:gravity="center_vertical"
+        android:orientation="horizontal"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toTopOf="parent">
+
+        <TextView
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="⚡"
+            android:textSize="28sp" />
+
+        <LinearLayout
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="10dp"
+            android:orientation="vertical">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="AeroCast"
+                android:textColor="#F8FAFC"
+                android:textSize="24sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvDeviceIp"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="LAN: Discovering…"
+                android:textColor="#38BDF8"
+                android:textSize="12sp" />
+        </LinearLayout>
+    </LinearLayout>
+
+    <!-- STATUS CARD -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/cardStatus"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="24dp"
+        android:background="@drawable/bg_card"
+        android:padding="20dp"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/headerLayout">
+
+        <TextView
+            android:id="@+id/tvStatusHeader"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Air Gesture Radar"
+            android:textColor="#38BDF8"
+            android:textSize="14sp"
+            android:textStyle="bold"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <TextView
+            android:id="@+id/tvStatusBody"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="Camera is strictly OFF (0% idle drain).\nSelect a file and make a Fist (✊) to cast to Windows Laptop."
+            android:textColor="#94A3B8"
+            android:textSize="13sp"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/tvStatusHeader" />
+
+        <ProgressBar
+            android:id="@+id/transferProgress"
+            style="?android:attr/progressBarStyleHorizontal"
+            android:layout_width="0dp"
+            android:layout_height="6dp"
+            android:layout_marginTop="16dp"
+            android:max="100"
+            android:progress="0"
+            android:progressTint="#38BDF8"
+            android:visibility="gone"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toBottomOf="@id/tvStatusBody" />
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <!-- STAGED FILE CARD -->
+    <androidx.constraintlayout.widget.ConstraintLayout
+        android:id="@+id/cardStagedFile"
+        android:layout_width="0dp"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="16dp"
+        android:background="@drawable/bg_card"
+        android:padding="16dp"
+        android:visibility="gone"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:layout_constraintTop_toBottomOf="@id/cardStatus"
+        tools:visibility="visible">
+
+        <TextView
+            android:id="@+id/stagedFileIcon"
+            android:layout_width="40dp"
+            android:layout_height="40dp"
+            android:background="#2E0284C7"
+            android:gravity="center"
+            android:text="📄"
+            android:textSize="20sp"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintStart_toStartOf="parent"
+            app:layout_constraintTop_toTopOf="parent" />
+
+        <LinearLayout
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_marginStart="12dp"
+            android:orientation="vertical"
+            app:layout_constraintBottom_toBottomOf="parent"
+            app:layout_constraintEnd_toEndOf="parent"
+            app:layout_constraintStart_toEndOf="@id/stagedFileIcon"
+            app:layout_constraintTop_toTopOf="parent">
+
+            <TextView
+                android:id="@+id/tvStagedFileName"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:ellipsize="end"
+                android:maxLines="1"
+                android:text="document.pdf"
+                android:textColor="#F8FAFC"
+                android:textSize="14sp"
+                android:textStyle="bold" />
+
+            <TextView
+                android:id="@+id/tvStagedFileSize"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="2.4 MB • Make Fist to Send"
+                android:textColor="#34D399"
+                android:textSize="12sp" />
+        </LinearLayout>
+
+    </androidx.constraintlayout.widget.ConstraintLayout>
+
+    <!-- ON-DEMAND CAMERA PREVIEW (Hidden/Tiny for Headless Processing) -->
+    <androidx.camera.view.PreviewView
+        android:id="@+id/cameraPreview"
+        android:layout_width="1dp"
+        android:layout_height="1dp"
+        android:visibility="invisible"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <!-- ACTION BUTTONS -->
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnPickFile"
+        android:layout_width="0dp"
+        android:layout_height="56dp"
+        android:layout_marginBottom="16dp"
+        android:backgroundTint="#0284C7"
+        android:text="@string/pick_file_button"
+        android:textAllCaps="false"
+        android:textColor="#FFFFFF"
+        android:textSize="15sp"
+        app:cornerRadius="16dp"
+        app:icon="@android:drawable/ic_menu_upload"
+        app:iconGravity="textStart"
+        app:layout_constraintBottom_toTopOf="@id/btnOpenDownloads"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent" />
+
+    <com.google.android.material.button.MaterialButton
+        android:id="@+id/btnOpenDownloads"
+        android:layout_width="0dp"
+        android:layout_height="48dp"
+        android:layout_marginBottom="16dp"
+        android:backgroundTint="#0F172A"
+        android:text="Open Download Folder"
+        android:textAllCaps="false"
+        android:textColor="#94A3B8"
+        android:textSize="13sp"
+        app:cornerRadius="14dp"
+        app:layout_constraintBottom_toBottomOf="parent"
+        app:layout_constraintEnd_toEndOf="parent"
+        app:layout_constraintStart_toStartOf="parent"
+        app:strokeColor="#1E293B"
+        app:strokeWidth="1dp" />
+
+</androidx.constraintlayout.widget.ConstraintLayout>

@@ -1,0 +1,14 @@
+<resources>
+    <!-- Base application theme. -->
+    <style name="Theme.AeroCast" parent="Theme.MaterialComponents.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/cyan_glow</item>
+        <item name="colorPrimaryVariant">@color/cyan_dark</item>
+        <item name="colorOnPrimary">@color/black_900</item>
+        <item name="colorSecondary">@color/emerald_glow</item>
+        <item name="colorSecondaryVariant">@color/emerald_dark</item>
+        <item name="colorOnSecondary">@color/black_900</item>
+        <item name="android:statusBarColor">@color/black_900</item>
+        <item name="android:navigationBarColor">@color/black_900</item>
+        <item name="android:windowBackground">@color/black_900</item>
+    </style>
+</resources>
