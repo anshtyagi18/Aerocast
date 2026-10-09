@@ -55,6 +55,7 @@ class NetworkManager(private val context: Context) {
         const val MSG_STAGE_ARMED = "ARMED_DROP"
         const val MSG_DROP_CONFIRMED = "DROP_CONFIRMED"
         const val MSG_FILE_HEADER = "FILE_HEADER"
+        const val EVENT_ARMED_DROP = "ARMED_DROP"
         const val SENDER_MOBILE = "MOBILE"
         const val SENDER_LAPTOP = "LAPTOP"
 
