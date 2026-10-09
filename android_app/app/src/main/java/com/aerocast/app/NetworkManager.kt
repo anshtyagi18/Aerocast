@@ -1,5 +1,10 @@
 package com.aerocast.app
 
+import android.annotation.SuppressLint
+import android.bluetooth.BluetoothAdapter
+import android.bluetooth.BluetoothDevice
+import android.bluetooth.BluetoothServerSocket
+import android.bluetooth.BluetoothSocket
 import android.content.Context
 import android.net.wifi.WifiManager
 import android.os.Environment
@@ -11,12 +16,14 @@ import org.json.JSONObject
 import java.io.*
 import java.net.*
 import java.security.MessageDigest
+import java.util.UUID
 
 /**
- * AeroCast Android Network Manager
- * Coordinates UDP Subnet Broadcast Signaling & High-Speed Raw TCP File Streaming.
- * Uses Kotlin Coroutines for asynchronous socket I/O and WifiManager.MulticastLock
- * to prevent Android OS from discarding local UDP multicast/broadcast frames.
+ * AeroCast Hybrid Android Network Manager (Wi-Fi TCP + Bluetooth RFCOMM Fallback).
+ * Simultaneous dual-channel discovery and streaming:
+ * - Channel 1: Wi-Fi UDP broadcast (255.255.255.255:42424) + High-Speed Raw TCP (42425).
+ * - Channel 2: Bluetooth RFCOMM listener & transmitter (UUID 00001101-0000-1000-8000-00805F9B34FB).
+ * - Live chunk streaming (64 KB), real-time speed (MB/s), SHA-256 hashing, and b"OK" handshake.
  */
 class NetworkManager(private val context: Context) {
 
@@ -24,25 +31,37 @@ class NetworkManager(private val context: Context) {
         private const val TAG = "AeroCastNet"
         const val UDP_BEACON_PORT = 42424
         const val TCP_TRANSFER_PORT = 42425
-        val MAGIC_HEADER = "AEROCAST\u0002".toByteArray(Charsets.UTF_8)
+        val BT_SPP_UUID: UUID = UUID.fromString("00001101-0000-1000-8000-00805F9B34FB")
+
+        val MAGIC_HEADER = "AERO_CAST_V1".toByteArray(Charsets.UTF_8) // 12 Bytes
         val MAGIC_HEADER_V1 = "AERO_CAST_V1".toByteArray(Charsets.UTF_8)
+        val MAGIC_HEADER_LEGACY = "AEROCAST\u0002".toByteArray(Charsets.UTF_8)
         const val CHUNK_SIZE = 64 * 1024
+
+        // Frame Message Types (1 Byte)
+        const val MSG_TYPE_DISCOVERY: Byte = 0x01
+        const val MSG_TYPE_DISCOVERY_ACK: Byte = 0x02
+        const val MSG_TYPE_STAGE_ARMED: Byte = 0x03
+        const val MSG_TYPE_DROP_CONFIRMED: Byte = 0x04
+        const val MSG_TYPE_FILE_HEADER: Byte = 0x05
+        const val MSG_TYPE_FILE_DATA: Byte = 0x06
+        const val MSG_TYPE_FILE_COMPLETE: Byte = 0x07
+        const val MSG_TYPE_CANCEL: Byte = 0x08
+        const val MSG_TYPE_PULL: Byte = 0x09
+        const val MSG_TYPE_PEER_INFO: Byte = 0x0A
 
         const val MSG_DISCOVERY_BEACON = "DISCOVERY"
         const val MSG_DISCOVERY_ACK = "DISCOVERY_ACK"
         const val MSG_STAGE_ARMED = "ARMED_DROP"
         const val MSG_DROP_CONFIRMED = "DROP_CONFIRMED"
-        const val MSG_FILE_HEADER = "FILE_HEADER"
-
         const val EVENT_ARMED_DROP = "ARMED_DROP"
-        const val EVENT_DROP_CONFIRMED = "DROP_CONFIRMED"
         const val SENDER_MOBILE = "MOBILE"
         const val SENDER_LAPTOP = "LAPTOP"
     }
 
     interface NetworkListener {
         fun onLaptopArmedDrop(filename: String, size: Long, senderIp: String, tcpPort: Int)
-        fun onTransferProgress(filename: String, percent: Float)
+        fun onTransferProgress(filename: String, percent: Float, speedMbps: Float)
         fun onTransferComplete(filename: String, savedFile: File)
         fun onError(error: String)
     }
@@ -53,10 +72,12 @@ class NetworkManager(private val context: Context) {
 
     private var udpSocket: DatagramSocket? = null
     private var tcpServerSocket: ServerSocket? = null
+    private var btServerSocket: BluetoothServerSocket? = null
     private var isListening = false
 
     private var stagedFile: File? = null
     private var multicastLock: WifiManager.MulticastLock? = null
+    private val bluetoothAdapter: BluetoothAdapter? by lazy { BluetoothAdapter.getDefaultAdapter() }
 
     fun setListener(l: NetworkListener) {
         this.listener = l
@@ -68,6 +89,7 @@ class NetworkManager(private val context: Context) {
         acquireMulticastLock()
         startUdpListener()
         startTcpServer()
+        startBluetoothServer()
     }
 
     fun stop() {
@@ -75,17 +97,18 @@ class NetworkManager(private val context: Context) {
         scope.coroutineContext.cancelChildren()
         try { udpSocket?.close() } catch (e: Exception) {}
         try { tcpServerSocket?.close() } catch (e: Exception) {}
+        try { btServerSocket?.close() } catch (e: Exception) {}
         releaseMulticastLock()
     }
 
     private fun acquireMulticastLock() {
         try {
             val wifi = context.applicationContext.getSystemService(Context.WIFI_SERVICE) as? WifiManager
-            multicastLock = wifi?.createMulticastLock("AeroCastLock")?.apply {
+            multicastLock = wifi?.createMulticastLock("AeroCastMulticastLock")?.apply {
                 setReferenceCounted(true)
                 acquire()
             }
-            Log.d(TAG, "MulticastLock successfully acquired: ${multicastLock?.isHeld}")
+            Log.d(TAG, "MulticastLock acquired: ${multicastLock?.isHeld}")
         } catch (e: Exception) {
             Log.w(TAG, "Could not acquire MulticastLock: ${e.message}")
         }
@@ -137,7 +160,21 @@ class NetworkManager(private val context: Context) {
         return InetAddress.getByName("255.255.255.255")
     }
 
-    // ================= UDP BEACON SIGNALING =================
+    // ================= FRAME ENCODING =================
+    private fun encodeFrame(msgType: Byte, payload: ByteArray): ByteArray {
+        val buf = ByteArray(12 + 1 + 4 + payload.size)
+        System.arraycopy(MAGIC_HEADER, 0, buf, 0, 12)
+        buf[12] = msgType
+        val len = payload.size
+        buf[13] = (len shr 24).toByte()
+        buf[14] = (len shr 16).toByte()
+        buf[15] = (len shr 8).toByte()
+        buf[16] = len.toByte()
+        System.arraycopy(payload, 0, buf, 17, payload.size)
+        return buf
+    }
+
+    // ================= 1. UDP BEACON SIGNALING =================
     private fun startUdpListener() {
         scope.launch {
             try {
@@ -213,8 +250,13 @@ class NetworkManager(private val context: Context) {
         }
     }
 
+    /**
+     * Broadcasts Stage Armed beacon simultaneously via UDP and Bluetooth RFCOMM fallback.
+     */
     fun broadcastArmedDropBeacon(file: File) {
         this.stagedFile = file
+
+        // 1. Primary Wi-Fi UDP Broadcast
         scope.launch {
             try {
                 val socket = DatagramSocket().apply { broadcast = true }
@@ -233,22 +275,167 @@ class NetworkManager(private val context: Context) {
 
                 val bytes = payload.toByteArray(Charsets.UTF_8)
                 val targetBcast = getBroadcastAddress()
-                val packet = DatagramPacket(bytes, bytes.size, targetBcast, UDP_BEACON_PORT)
-                socket.send(packet)
-
-                // Also send to 255.255.255.255 for subnet edge routers
-                val universalPacket = DatagramPacket(bytes, bytes.size, InetAddress.getByName("255.255.255.255"), UDP_BEACON_PORT)
-                socket.send(universalPacket)
+                socket.send(DatagramPacket(bytes, bytes.size, targetBcast, UDP_BEACON_PORT))
+                socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("255.255.255.255"), UDP_BEACON_PORT))
                 socket.close()
-
-                Log.d(TAG, "Broadcasted Mobile ARMED_DROP beacon for ${file.name}")
+                Log.d(TAG, "Broadcasted Mobile ARMED_DROP beacon over Wi-Fi for ${file.name}")
             } catch (e: Exception) {
-                Log.e(TAG, "Failed to broadcast beacon: ${e.message}")
+                Log.e(TAG, "Failed to broadcast Wi-Fi beacon: ${e.message}")
+            }
+        }
+
+        // 2. Secondary Bluetooth RFCOMM Fallback to Paired Laptops
+        scope.launch {
+            broadcastOverBluetoothFallback(file)
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun broadcastOverBluetoothFallback(file: File) {
+        val adapter = bluetoothAdapter ?: return
+        val paired = try { adapter.bondedDevices } catch (e: Exception) { null } ?: return
+
+        val payload = JSONObject().apply {
+            put("proto", "AEROCAST_V2_NATIVE")
+            put("event", MSG_STAGE_ARMED)
+            put("sender", SENDER_MOBILE)
+            put("device_name", android.os.Build.MODEL)
+            put("sender_ip", getLocalIpAddress())
+            put("tcp_port", TCP_TRANSFER_PORT)
+            put("filename", file.name)
+            put("size", file.length())
+        }.toString().toByteArray(Charsets.UTF_8)
+
+        val frame = encodeFrame(MSG_TYPE_STAGE_ARMED, payload)
+
+        for (device in paired) {
+            try {
+                val socket = device.createInsecureRfcommSocketToServiceRecord(BT_SPP_UUID)
+                socket.connect()
+                val out = socket.outputStream
+                out.write(frame)
+                out.flush()
+                socket.close()
+                Log.d(TAG, "Dispatched stage beacon to paired BT device: ${device.name}")
+                break
+            } catch (e: Exception) {
+                // Try reflection fallback channel 5
+                try {
+                    val m = device.javaClass.getMethod("createRfcommSocket", Int::class.javaPrimitiveType)
+                    val s = m.invoke(device, 5) as BluetoothSocket
+                    s.connect()
+                    s.outputStream.write(frame)
+                    s.outputStream.flush()
+                    s.close()
+                    Log.d(TAG, "Dispatched stage beacon via RFCOMM channel 5 to ${device.name}")
+                    break
+                } catch (ignored: Exception) {}
             }
         }
     }
 
-    // ================= TCP SERVER (SERVING MOBILE STAGED FILES) =================
+    // ================= 2. BLUETOOTH RFCOMM SERVER =================
+    @SuppressLint("MissingPermission")
+    private fun startBluetoothServer() {
+        scope.launch {
+            val adapter = bluetoothAdapter ?: return@launch
+            try {
+                btServerSocket = adapter.listenUsingInsecureRfcommWithServiceRecord("AeroCast", BT_SPP_UUID)
+                Log.d(TAG, "Bluetooth RFCOMM server active with SPP UUID $BT_SPP_UUID")
+
+                while (isActive && isListening) {
+                    try {
+                        val socket = btServerSocket?.accept() ?: break
+                        handleIncomingBluetoothClient(socket)
+                    } catch (e: Exception) {
+                        if (!isListening) break
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Bluetooth RFCOMM server error: ${e.message}")
+            }
+        }
+    }
+
+    private fun handleIncomingBluetoothClient(socket: BluetoothSocket) {
+        scope.launch {
+            try {
+                val input = DataInputStream(socket.inputStream)
+                val output = DataOutputStream(socket.outputStream)
+
+                // Read 17-byte standard frame: [12B Header] + [1B MsgType] + [4B PayloadLen]
+                val header = ByteArray(17)
+                input.readFully(header)
+
+                val magic = ByteArray(12)
+                System.arraycopy(header, 0, magic, 0, 12)
+                val msgType = header[12]
+                val payloadLen = ((header[13].toInt() and 0xFF) shl 24) or
+                        ((header[14].toInt() and 0xFF) shl 16) or
+                        ((header[15].toInt() and 0xFF) shl 8) or
+                        (header[16].toInt() and 0xFF)
+
+                val payloadBytes = ByteArray(payloadLen)
+                input.readFully(payloadBytes)
+                val meta = JSONObject(String(payloadBytes, Charsets.UTF_8))
+
+                val action = meta.optString("action")
+
+                if (msgType == MSG_TYPE_STAGE_ARMED || meta.optString("event") == MSG_STAGE_ARMED) {
+                    val filename = meta.optString("filename", "Unknown File")
+                    val size = meta.optLong("size", meta.optLong("filesize", 0L))
+                    val senderIp = meta.optString("sender_ip", "")
+                    val tcpPort = meta.optInt("tcp_port", TCP_TRANSFER_PORT)
+
+                    mainHandler.post {
+                        listener?.onLaptopArmedDrop(filename, size, senderIp, tcpPort)
+                    }
+                } else if (action == "PULL") {
+                    val fileToSend = stagedFile
+                    if (fileToSend != null && fileToSend.exists()) {
+                        val respMeta = JSONObject().apply {
+                            put("action", "STREAM")
+                            put("filename", fileToSend.name)
+                            put("size", fileToSend.length())
+                        }.toString().toByteArray(Charsets.UTF_8)
+
+                        output.write(encodeFrame(MSG_TYPE_FILE_HEADER, respMeta))
+                        output.flush()
+
+                        val totalSize = fileToSend.length()
+                        var sentBytes = 0L
+                        val buffer = ByteArray(CHUNK_SIZE)
+                        val startTime = System.currentTimeMillis()
+
+                        FileInputStream(fileToSend).use { fis ->
+                            var read: Int
+                            while (fis.read(buffer).also { read = it } != -1) {
+                                output.write(buffer, 0, read)
+                                sentBytes += read
+                                if (totalSize > 0) {
+                                    val pct = (sentBytes.toFloat() / totalSize.toFloat()) * 100f
+                                    val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                                    val speedMbps = (sentBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                                    mainHandler.post { listener?.onTransferProgress(fileToSend.name, pct, speedMbps) }
+                                }
+                            }
+                        }
+                        output.flush()
+
+                        val ack = ByteArray(2)
+                        input.readFully(ack)
+                        mainHandler.post { listener?.onTransferComplete(fileToSend.name, fileToSend) }
+                    }
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Bluetooth client error: ${e.message}")
+            } finally {
+                try { socket.close() } catch (e: Exception) {}
+            }
+        }
+    }
+
+    // ================= 3. TCP SERVER (SERVING MOBILE STAGED FILES) =================
     private fun startTcpServer() {
         scope.launch {
             try {
@@ -276,17 +463,16 @@ class NetworkManager(private val context: Context) {
                 val input = DataInputStream(socket.getInputStream())
                 val output = DataOutputStream(socket.getOutputStream())
 
-                // Verify magic header
-                val magic = ByteArray(MAGIC_HEADER.size)
-                input.readFully(magic)
-                if (!magic.contentEquals(MAGIC_HEADER) && !magic.contentEquals(MAGIC_HEADER_V1)) {
-                    socket.close()
-                    return@launch
-                }
+                // Read 17-byte standard frame: [12B Header] + [1B MsgType] + [4B PayloadLen]
+                val header = ByteArray(17)
+                input.readFully(header)
 
-                // 4-byte big-endian header length
-                val metaLen = input.readInt()
-                val metaBytes = ByteArray(metaLen)
+                val payloadLen = ((header[13].toInt() and 0xFF) shl 24) or
+                        ((header[14].toInt() and 0xFF) shl 16) or
+                        ((header[15].toInt() and 0xFF) shl 8) or
+                        (header[16].toInt() and 0xFF)
+
+                val metaBytes = ByteArray(payloadLen)
                 input.readFully(metaBytes)
                 val meta = JSONObject(String(metaBytes, Charsets.UTF_8))
 
@@ -294,21 +480,21 @@ class NetworkManager(private val context: Context) {
                 if (action == "PULL") {
                     val fileToSend = stagedFile
                     if (fileToSend != null && fileToSend.exists()) {
-                        // Stream staged file to Laptop
-                        output.write(MAGIC_HEADER)
                         val sendMeta = JSONObject().apply {
                             put("type", MSG_FILE_HEADER)
                             put("action", "STREAM")
                             put("filename", fileToSend.name)
                             put("size", fileToSend.length())
-                            put("filesize", fileToSend.length())
                         }.toString().toByteArray(Charsets.UTF_8)
-                        output.writeInt(sendMeta.size)
-                        output.write(sendMeta)
+
+                        output.write(encodeFrame(MSG_TYPE_FILE_HEADER, sendMeta))
+                        output.flush()
 
                         val totalSize = fileToSend.length()
                         var sentBytes = 0L
                         val buffer = ByteArray(CHUNK_SIZE)
+                        val startTime = System.currentTimeMillis()
+
                         FileInputStream(fileToSend).use { fis ->
                             var read: Int
                             while (fis.read(buffer).also { read = it } != -1) {
@@ -316,22 +502,20 @@ class NetworkManager(private val context: Context) {
                                 sentBytes += read
                                 if (totalSize > 0) {
                                     val pct = (sentBytes.toFloat() / totalSize.toFloat()) * 100f
-                                    mainHandler.post { listener?.onTransferProgress(fileToSend.name, pct) }
+                                    val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                                    val speedMbps = (sentBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                                    mainHandler.post { listener?.onTransferProgress(fileToSend.name, pct, speedMbps) }
                                 }
                             }
                         }
                         output.flush()
 
-                        // Read ACK
                         val ack = ByteArray(2)
                         input.readFully(ack)
-
-                        mainHandler.post {
-                            listener?.onTransferComplete(fileToSend.name, fileToSend)
-                        }
+                        mainHandler.post { listener?.onTransferComplete(fileToSend.name, fileToSend) }
                     }
                 } else {
-                    // Laptop pushing file directly
+                    // Push transfer
                     val filename = meta.optString("filename", "received_${System.currentTimeMillis()}.bin")
                     val totalSize = meta.optLong("size", meta.optLong("filesize", 0L))
 
@@ -341,6 +525,8 @@ class NetworkManager(private val context: Context) {
 
                     var receivedBytes = 0L
                     val buffer = ByteArray(CHUNK_SIZE)
+                    val startTime = System.currentTimeMillis()
+
                     FileOutputStream(destFile).use { fos ->
                         while (receivedBytes < totalSize) {
                             val toRead = minOf(CHUNK_SIZE.toLong(), totalSize - receivedBytes).toInt()
@@ -350,19 +536,17 @@ class NetworkManager(private val context: Context) {
                             receivedBytes += count
                             if (totalSize > 0) {
                                 val pct = (receivedBytes.toFloat() / totalSize.toFloat()) * 100f
-                                mainHandler.post { listener?.onTransferProgress(filename, pct) }
+                                val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                                val speedMbps = (receivedBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                                mainHandler.post { listener?.onTransferProgress(filename, pct, speedMbps) }
                             }
                         }
                         fos.flush()
                     }
 
-                    // Send OK
                     output.write("OK".toByteArray(Charsets.UTF_8))
                     output.flush()
-
-                    mainHandler.post {
-                        listener?.onTransferComplete(filename, destFile)
-                    }
+                    mainHandler.post { listener?.onTransferComplete(filename, destFile) }
                 }
             } catch (e: Exception) {
                 Log.e(TAG, "TCP client error: ${e.message}")
@@ -372,51 +556,50 @@ class NetworkManager(private val context: Context) {
         }
     }
 
-    // ================= TCP CLIENT (PULL FILE FROM LAPTOP) =================
+    // ================= 4. TCP CLIENT (PULL FILE WITH BLUETOOTH FALLBACK) =================
     fun pullFileFromLaptop(laptopIp: String, port: Int, filename: String, expectedSize: Long) {
         scope.launch {
             var socket: Socket? = null
+            var success = false
+
+            // 1. Try High-Speed Wi-Fi TCP Stream
             try {
                 socket = Socket().apply {
-                    connect(InetSocketAddress(laptopIp, port), 10000)
+                    connect(InetSocketAddress(laptopIp, port), 6000)
                     soTimeout = 25000
                 }
                 val output = DataOutputStream(socket.getOutputStream())
                 val input = DataInputStream(socket.getInputStream())
 
-                // 1. Send magic header
-                output.write(MAGIC_HEADER)
-
-                // 2. Send PULL request metadata
-                val reqJson = JSONObject().apply {
+                val reqMeta = JSONObject().apply {
                     put("action", "PULL")
                     put("filename", filename)
                 }.toString().toByteArray(Charsets.UTF_8)
-                output.writeInt(reqJson.size)
-                output.write(reqJson)
+
+                output.write(encodeFrame(MSG_TYPE_PULL, reqMeta))
                 output.flush()
 
-                // 3. Read Laptop Stream Header
-                val magic = ByteArray(MAGIC_HEADER.size)
-                input.readFully(magic)
-                if (!magic.contentEquals(MAGIC_HEADER) && !magic.contentEquals(MAGIC_HEADER_V1)) {
-                    throw IOException("Invalid magic header from Laptop")
-                }
+                // Read 17-byte header
+                val header = ByteArray(17)
+                input.readFully(header)
+                val payloadLen = ((header[13].toInt() and 0xFF) shl 24) or
+                        ((header[14].toInt() and 0xFF) shl 16) or
+                        ((header[15].toInt() and 0xFF) shl 8) or
+                        (header[16].toInt() and 0xFF)
 
-                val headerLen = input.readInt()
-                val headerBytes = ByteArray(headerLen)
+                val headerBytes = ByteArray(payloadLen)
                 input.readFully(headerBytes)
                 val respJson = JSONObject(String(headerBytes, Charsets.UTF_8))
-
                 val totalSize = respJson.optLong("size", respJson.optLong("filesize", expectedSize))
 
-                // 4. Save stream directly to Download/AeroCast/
                 val aeroCastDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AeroCast")
                 if (!aeroCastDir.exists()) aeroCastDir.mkdirs()
                 val destFile = File(aeroCastDir, filename)
 
                 var receivedBytes = 0L
                 val buffer = ByteArray(CHUNK_SIZE)
+                val startTime = System.currentTimeMillis()
+
                 FileOutputStream(destFile).use { fos ->
                     while (receivedBytes < totalSize) {
                         val toRead = minOf(CHUNK_SIZE.toLong(), totalSize - receivedBytes).toInt()
@@ -427,26 +610,106 @@ class NetworkManager(private val context: Context) {
 
                         if (totalSize > 0) {
                             val pct = (receivedBytes.toFloat() / totalSize.toFloat()) * 100f
-                            mainHandler.post { listener?.onTransferProgress(filename, pct) }
+                            val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                            val speedMbps = (receivedBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                            mainHandler.post { listener?.onTransferProgress(filename, pct, speedMbps) }
                         }
                     }
                     fos.flush()
                 }
 
-                // 5. Send OK ack
                 output.write("OK".toByteArray(Charsets.UTF_8))
                 output.flush()
 
-                mainHandler.post {
-                    listener?.onTransferComplete(filename, destFile)
-                }
-
+                mainHandler.post { listener?.onTransferComplete(filename, destFile) }
+                success = true
             } catch (e: Exception) {
-                Log.e(TAG, "Pull error: ${e.message}", e)
-                mainHandler.post { listener?.onError("Transfer failed: ${e.message}") }
+                Log.w(TAG, "Wi-Fi TCP stream failed: ${e.message}. Attempting Bluetooth RFCOMM fallback...")
             } finally {
                 try { socket?.close() } catch (e: Exception) {}
             }
+
+            // 2. Secondary Bluetooth RFCOMM Fallback
+            if (!success) {
+                pullFileOverBluetoothFallback(filename, expectedSize)
+            }
+        }
+    }
+
+    @SuppressLint("MissingPermission")
+    private fun pullFileOverBluetoothFallback(filename: String, expectedSize: Long) {
+        val adapter = bluetoothAdapter ?: return
+        val paired = try { adapter.bondedDevices } catch (e: Exception) { null } ?: return
+
+        for (device in paired) {
+            var btSocket: BluetoothSocket? = null
+            try {
+                btSocket = device.createInsecureRfcommSocketToServiceRecord(BT_SPP_UUID)
+                btSocket.connect()
+
+                val output = DataOutputStream(btSocket.outputStream)
+                val input = DataInputStream(btSocket.inputStream)
+
+                val reqMeta = JSONObject().apply {
+                    put("action", "PULL")
+                    put("filename", filename)
+                }.toString().toByteArray(Charsets.UTF_8)
+
+                output.write(encodeFrame(MSG_TYPE_PULL, reqMeta))
+                output.flush()
+
+                val header = ByteArray(17)
+                input.readFully(header)
+                val payloadLen = ((header[13].toInt() and 0xFF) shl 24) or
+                        ((header[14].toInt() and 0xFF) shl 16) or
+                        ((header[15].toInt() and 0xFF) shl 8) or
+                        (header[16].toInt() and 0xFF)
+
+                val headerBytes = ByteArray(payloadLen)
+                input.readFully(headerBytes)
+                val respJson = JSONObject(String(headerBytes, Charsets.UTF_8))
+                val totalSize = respJson.optLong("size", respJson.optLong("filesize", expectedSize))
+
+                val aeroCastDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AeroCast")
+                if (!aeroCastDir.exists()) aeroCastDir.mkdirs()
+                val destFile = File(aeroCastDir, filename)
+
+                var receivedBytes = 0L
+                val buffer = ByteArray(CHUNK_SIZE)
+                val startTime = System.currentTimeMillis()
+
+                FileOutputStream(destFile).use { fos ->
+                    while (receivedBytes < totalSize) {
+                        val toRead = minOf(CHUNK_SIZE.toLong(), totalSize - receivedBytes).toInt()
+                        val count = input.read(buffer, 0, toRead)
+                        if (count == -1) break
+                        fos.write(buffer, 0, count)
+                        receivedBytes += count
+
+                        if (totalSize > 0) {
+                            val pct = (receivedBytes.toFloat() / totalSize.toFloat()) * 100f
+                            val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                            val speedMbps = (receivedBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                            mainHandler.post { listener?.onTransferProgress(filename, pct, speedMbps) }
+                        }
+                    }
+                    fos.flush()
+                }
+
+                output.write("OK".toByteArray(Charsets.UTF_8))
+                output.flush()
+
+                mainHandler.post { listener?.onTransferComplete(filename, destFile) }
+                return
+            } catch (e: Exception) {
+                Log.w(TAG, "BT fallback to ${device.name} failed: ${e.message}")
+            } finally {
+                try { btSocket?.close() } catch (e: Exception) {}
+            }
+        }
+
+        mainHandler.post {
+            listener?.onError("Both Wi-Fi TCP and Bluetooth RFCOMM transfers failed")
         }
     }
 }

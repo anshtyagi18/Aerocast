@@ -1,19 +1,21 @@
 package com.aerocast.app
 
 import android.Manifest
+import android.annotation.SuppressLint
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.graphics.Color
 import android.net.Uri
 import android.os.*
 import android.provider.OpenableColumns
 import android.view.View
-import android.view.animation.AccelerateDecelerateInterpolator
 import android.widget.Toast
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.content.ContextCompat
 import com.aerocast.app.databinding.ActivityMainBinding
+import com.google.mediapipe.tasks.components.containers.NormalizedLandmark
 import java.io.File
 import java.io.FileOutputStream
 
@@ -28,20 +30,19 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
     private var activeIncomingPort: Int = 42425
     private var activeIncomingFilename: String? = null
     private var activeIncomingSize: Long = 0L
+    private var isSessionActive = false
 
     // File picker launcher
     private val pickFileLauncher = registerForActivityResult(ActivityResultContracts.GetContent()) { uri: Uri? ->
         uri?.let { handleFileSelected(it) }
     }
 
-    // Runtime permissions launcher
+    // Comprehensive runtime permissions launcher (Camera, Bluetooth, Location, Storage)
     private val requestPermissionsLauncher = registerForActivityResult(
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         val cameraGranted = permissions[Manifest.permission.CAMERA] ?: false
-        if (cameraGranted) {
-            Toast.makeText(this, "Camera ready for air gestures", Toast.LENGTH_SHORT).show()
-        } else {
+        if (!cameraGranted) {
             Toast.makeText(this, "Camera permission needed for Air Drop / Grab gestures", Toast.LENGTH_LONG).show()
         }
     }
@@ -57,8 +58,6 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
 
         setupUI()
         checkPermissions()
-
-        // Handle incoming Android share sheet ("Share via AeroCast")
         handleShareIntent(intent)
     }
 
@@ -66,13 +65,15 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         super.onResume()
         networkManager.start()
         val ip = networkManager.getLocalIpAddress()
-        binding.tvDeviceIp.text = "LAN: $ip • Port 42424"
+        binding.tvDeviceIp.text = "Wi-Fi LAN: $ip"
+        binding.tvBluetoothStatus.text = "Bluetooth: RFCOMM Fallback Armed (SPP)"
     }
 
     override fun onPause() {
         super.onPause()
-        visionService.stopGestureWatch()
-        networkManager.stop()
+        if (!isSessionActive) {
+            visionService.stopGestureWatch()
+        }
     }
 
     override fun onDestroy() {
@@ -99,23 +100,50 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
                 Toast.makeText(this, "Downloads folder: Download/AeroCast", Toast.LENGTH_LONG).show()
             }
         }
+
+        binding.btnCancelStaging.setOnClickListener {
+            cancelActiveSession()
+        }
+
+        binding.btnManualSend.setOnClickListener {
+            triggerFistSend()
+        }
+
+        binding.btnManualReceive.setOnClickListener {
+            triggerPalmReceive()
+        }
+
+        updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "10s")
     }
 
     private fun checkPermissions() {
         val permissionsToRequest = mutableListOf<String>()
+
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
             permissionsToRequest.add(Manifest.permission.CAMERA)
         }
-        if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.P) {
-            if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
-                permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE)
+
+        // Bluetooth Permissions for Android 12+ (API 31+)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_CONNECT) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(Manifest.permission.BLUETOOTH_CONNECT)
+            }
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.BLUETOOTH_SCAN) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(Manifest.permission.BLUETOOTH_SCAN)
+            }
+        } else {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) != PackageManager.PERMISSION_GRANTED) {
+                permissionsToRequest.add(Manifest.permission.ACCESS_FINE_LOCATION)
             }
         }
+
+        // Storage permissions
         if (Build.VERSION.SDK_INT <= Build.VERSION_CODES.S_V2) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.READ_EXTERNAL_STORAGE) != PackageManager.PERMISSION_GRANTED) {
                 permissionsToRequest.add(Manifest.permission.READ_EXTERNAL_STORAGE)
             }
         }
+
         if (permissionsToRequest.isNotEmpty()) {
             requestPermissionsLauncher.launch(permissionsToRequest.toTypedArray())
         }
@@ -128,30 +156,179 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         }
     }
 
-    // ================= FILE STAGING & AIR GRAB FLOW =================
+    // ================= 1. FILE STAGING & AIR GRAB FLOW =================
     private fun handleFileSelected(uri: Uri) {
         val file = copyUriToInternalFile(uri) ?: return
         stagedFile = file
+        isSessionActive = true
 
-        // Update Staged card in UI
-        binding.cardStagedFile.visibility = View.VISIBLE
-        binding.tvStagedFileName.text = file.name
-        binding.tvStagedFileSize.text = "${formatFileSize(file.length())} • Make Fist to Cast"
+        // Display staged file card in bottom drawer
+        binding.cardFileBadge.visibility = View.VISIBLE
+        binding.tvFileName.text = file.name
+        binding.tvFileSize.text = "${formatFileSize(file.length())} • ✊ Fist or Tap to Cast"
 
-        // Show Dynamic Capsule
-        showCapsule(
-            icon = "✊",
-            title = "Air Send: ${file.name}",
-            subtitle = "Make Fist (✊) to Cast",
-            isAccent = true
-        )
+        // Show manual send button
+        binding.manualActionRow.visibility = View.VISIBLE
+        binding.btnManualSend.visibility = View.VISIBLE
+        binding.btnManualReceive.visibility = View.GONE
 
-        // Wake front camera for 5-second window waiting for Fist Grab
+        // Update floating pill badge to Amber
+        updatePillBadge("✊", "MAKE A FIST TO CAST", "#F59E0B", "10s")
+
+        // Start 10-second front camera watch for Fist Grab with live viewfinder
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            visionService.startGestureWatch(this, VisionService.GESTURE_FIST, this)
+            visionService.startGestureWatch(this, binding.cameraPreview, VisionService.GESTURE_FIST, this)
         } else {
             checkPermissions()
         }
+    }
+
+    private fun triggerFistSend() {
+        val file = stagedFile ?: return
+        vibratePhone(120)
+
+        // Turn floating pill badge Bright Amber: GRAB DETECTED
+        updatePillBadge("✊", "GRAB DETECTED - STAGING FILE", "#F59E0B", "ARMED")
+
+        // Broadcast stage beacon via Wi-Fi UDP and Bluetooth RFCOMM fallback
+        networkManager.broadcastArmedDropBeacon(file)
+        binding.tvFileSize.text = "${formatFileSize(file.length())} • Staged in Air! Open Palm on PC"
+    }
+
+    // ================= 2. INCOMING DROP CONFIRMATION FLOW =================
+    override fun onLaptopArmedDrop(filename: String, size: Long, senderIp: String, tcpPort: Int) {
+        vibratePhone(120)
+        isSessionActive = true
+
+        activeIncomingLaptopIp = senderIp
+        activeIncomingPort = tcpPort
+        activeIncomingFilename = filename
+        activeIncomingSize = size
+
+        // Display incoming file card in bottom drawer
+        binding.cardFileBadge.visibility = View.VISIBLE
+        binding.tvFileName.text = filename
+        binding.tvFileSize.text = "${formatFileSize(size)} • ✋ Show Palm to Receive"
+
+        // Show manual receive button
+        binding.manualActionRow.visibility = View.VISIBLE
+        binding.btnManualReceive.visibility = View.VISIBLE
+        binding.btnManualSend.visibility = View.GONE
+
+        // Update floating pill badge to Purple
+        updatePillBadge("✋", "OPEN PALM TO RECEIVE", "#A855F7", "10s")
+
+        // Start 10-second front camera watch for Open Palm Drop
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
+            visionService.startGestureWatch(this, binding.cameraPreview, VisionService.GESTURE_PALM, this)
+        } else {
+            checkPermissions()
+        }
+    }
+
+    private fun triggerPalmReceive() {
+        val laptopIp = activeIncomingLaptopIp ?: return
+        val filename = activeIncomingFilename ?: "received_file"
+        vibratePhone(120)
+
+        // Turn floating pill badge Vibrant Purple: DROP CONFIRMED
+        updatePillBadge("✋", "DROP CONFIRMED - RECEIVING STREAM", "#A855F7", "PULL")
+
+        // Transition screen to active transfer view
+        binding.transferOverlayContainer.visibility = View.VISIBLE
+        binding.transferProgressBar.progress = 0
+        binding.tvTransferPercent.text = "0%"
+        binding.tvTransferSpeed.text = "⚡ Connecting to Laptop…"
+
+        // Pull file from Laptop over Wi-Fi TCP or Bluetooth RFCOMM fallback
+        networkManager.pullFileFromLaptop(laptopIp, activeIncomingPort, filename, activeIncomingSize)
+    }
+
+    // ================= 3. VISION CALLBACKS =================
+    override fun onGestureDetected(gesture: String) {
+        if (gesture == VisionService.GESTURE_FIST) {
+            triggerFistSend()
+        } else if (gesture == VisionService.GESTURE_PALM) {
+            triggerPalmReceive()
+        }
+    }
+
+    override fun onTimeout() {
+        binding.gestureOverlay.clear()
+        if (!isSessionActive) {
+            updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "IDLE")
+        }
+    }
+
+    override fun onProgress(streak: Int, required: Int, secondsLeft: Float) {
+        val badge = if (streak > 0) "$streak/$required" else "${secondsLeft.toInt()}s"
+        binding.pillTimerBadge.text = badge
+    }
+
+    override fun onLandmarks(landmarks: List<NormalizedLandmark>?, gesture: String) {
+        binding.gestureOverlay.updateResults(landmarks, gesture, scanning = true)
+    }
+
+    // ================= 4. NETWORK CALLBACKS =================
+    override fun onTransferProgress(filename: String, percent: Float, speedMbps: Float) {
+        binding.transferOverlayContainer.visibility = View.VISIBLE
+        binding.transferProgressBar.progress = percent.toInt()
+        binding.tvTransferPercent.text = "${percent.toInt()}%"
+        binding.tvTransferSpeed.text = "⚡ Streaming: ${String.format("%.1f", speedMbps)} MB/s"
+
+        // Floating pill badge Active Blue
+        updatePillBadge("⚡", "TRANSFERRING: ${percent.toInt()}% (${String.format("%.1f", speedMbps)} MB/s)", "#38BDF8", "${percent.toInt()}%")
+    }
+
+    override fun onTransferComplete(filename: String, savedFile: File) {
+        vibratePhone(220)
+        isSessionActive = false
+
+        // Floating pill badge Solid Green
+        updatePillBadge("✅", "TRANSFER COMPLETE!", "#10B981", "100%")
+
+        binding.transferOverlayContainer.visibility = View.GONE
+        binding.cardFileBadge.visibility = View.GONE
+        binding.manualActionRow.visibility = View.GONE
+        binding.gestureOverlay.clear()
+
+        // Release camera cleanly after file complete and handshake
+        visionService.stopGestureWatch()
+
+        Toast.makeText(this, "Saved directly to Download/AeroCast/${savedFile.name}", Toast.LENGTH_LONG).show()
+
+        Handler(Looper.getMainLooper()).postDelayed({
+            updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "10s")
+        }, 3000)
+    }
+
+    override fun onError(error: String) {
+        isSessionActive = false
+        binding.transferOverlayContainer.visibility = View.GONE
+        binding.gestureOverlay.clear()
+        visionService.stopGestureWatch()
+        Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
+        updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "ERR")
+    }
+
+    private fun cancelActiveSession() {
+        isSessionActive = false
+        stagedFile = null
+        activeIncomingLaptopIp = null
+        visionService.stopGestureWatch()
+        binding.gestureOverlay.clear()
+        binding.cardFileBadge.visibility = View.GONE
+        binding.manualActionRow.visibility = View.GONE
+        binding.transferOverlayContainer.visibility = View.GONE
+        updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "10s")
+    }
+
+    private fun updatePillBadge(icon: String, text: String, colorHex: String, timerText: String) {
+        binding.pillIcon.text = icon
+        binding.pillText.text = text
+        binding.pillText.setTextColor(Color.parseColor(colorHex))
+        binding.pillTimerBadge.text = timerText
+        binding.pillTimerBadge.setTextColor(Color.parseColor(colorHex))
     }
 
     private fun copyUriToInternalFile(uri: Uri): File? {
@@ -174,142 +351,6 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         } catch (e: Exception) {
             Toast.makeText(this, "Failed to load file: ${e.message}", Toast.LENGTH_SHORT).show()
             return null
-        }
-    }
-
-    // ================= VISION CALLBACKS =================
-    override fun onGestureDetected(gesture: String) {
-        vibratePhone(120)
-
-        if (gesture == VisionService.GESTURE_FIST) {
-            // User confirmed Fist Grab -> broadcast beacon
-            val file = stagedFile ?: return
-            networkManager.broadcastArmedDropBeacon(file)
-
-            showCapsule(
-                icon = "✊",
-                title = "File in Air: ${file.name}",
-                subtitle = "Open Palm on Laptop to Drop",
-                isAccent = true
-            )
-            binding.tvStatusBody.text = "File is in the air!\nPresent Open Palm (✋) to Laptop webcam to complete transfer."
-
-        } else if (gesture == VisionService.GESTURE_PALM) {
-            // User confirmed Open Palm -> pull file from Laptop
-            val laptopIp = activeIncomingLaptopIp ?: return
-            val filename = activeIncomingFilename ?: "received_file"
-
-            showCapsule(
-                icon = "⚡",
-                title = "Receiving: $filename",
-                subtitle = "High Speed LAN Streaming…",
-                isAccent = true
-            )
-            binding.transferProgress.visibility = View.VISIBLE
-            binding.transferProgress.progress = 0
-
-            networkManager.pullFileFromLaptop(laptopIp, activeIncomingPort, filename, activeIncomingSize)
-        }
-    }
-
-    override fun onTimeout() {
-        hideCapsule()
-        binding.tvStatusBody.text = "Gesture window closed. Cameras are completely OFF (0% drain)."
-    }
-
-    override fun onProgress(streak: Int, required: Int, secondsLeft: Float) {
-        if (streak > 0) {
-            binding.capsuleBadge.text = "$streak/$required"
-        } else {
-            binding.capsuleBadge.text = "${secondsLeft.toInt()}s"
-        }
-    }
-
-    // ================= NETWORK CALLBACKS =================
-    override fun onLaptopArmedDrop(filename: String, size: Long, senderIp: String, tcpPort: Int) {
-        vibratePhone(100)
-
-        activeIncomingLaptopIp = senderIp
-        activeIncomingPort = tcpPort
-        activeIncomingFilename = filename
-        activeIncomingSize = size
-
-        // Laptop staged a file -> wake up front camera for 5 seconds waiting for Open Palm!
-        showCapsule(
-            icon = "✋",
-            title = "File in Air: $filename",
-            subtitle = "Open Palm (✋) to Receive • ${formatFileSize(size)}",
-            isAccent = true
-        )
-
-        binding.tvStatusBody.text = "Laptop casted '$filename'!\nPresent Open Palm (✋) to phone camera to drop it."
-        if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
-            visionService.startGestureWatch(this, VisionService.GESTURE_PALM, this)
-        } else {
-            checkPermissions()
-        }
-    }
-
-    override fun onTransferProgress(filename: String, percent: Float) {
-        binding.transferProgress.visibility = View.VISIBLE
-        binding.transferProgress.progress = percent.toInt()
-        binding.capsuleSubtitle.text = "Transferring… ${percent.toInt()}%"
-        binding.capsuleBadge.text = "${percent.toInt()}%"
-    }
-
-    override fun onTransferComplete(filename: String, savedFile: File) {
-        vibratePhone(200)
-
-        binding.transferProgress.visibility = View.GONE
-        showCapsule(
-            icon = "✓",
-            title = "Dropped: $filename",
-            subtitle = "Saved to Download/AeroCast",
-            isAccent = false
-        )
-
-        binding.tvStatusBody.text = "Transfer complete! File saved directly to Download/AeroCast/${savedFile.name}."
-
-        Handler(Looper.getMainLooper()).postDelayed({
-            hideCapsule()
-        }, 2500)
-    }
-
-    override fun onError(error: String) {
-        binding.transferProgress.visibility = View.GONE
-        Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
-        hideCapsule()
-    }
-
-    // ================= DYNAMIC CAPSULE ANIMATIONS =================
-    private fun showCapsule(icon: String, title: String, subtitle: String, isAccent: Boolean) {
-        binding.capsuleIcon.text = icon
-        binding.capsuleTitle.text = title
-        binding.capsuleSubtitle.text = subtitle
-
-        if (binding.dynamicCapsule.visibility != View.VISIBLE) {
-            binding.dynamicCapsule.visibility = View.VISIBLE
-            binding.dynamicCapsule.translationY = -120f
-            binding.dynamicCapsule.alpha = 0f
-            binding.dynamicCapsule.animate()
-                .translationY(0f)
-                .alpha(1f)
-                .setDuration(300)
-                .setInterpolator(AccelerateDecelerateInterpolator())
-                .start()
-        }
-    }
-
-    private fun hideCapsule() {
-        if (binding.dynamicCapsule.visibility == View.VISIBLE) {
-            binding.dynamicCapsule.animate()
-                .translationY(-120f)
-                .alpha(0f)
-                .setDuration(250)
-                .withEndAction {
-                    binding.dynamicCapsule.visibility = View.GONE
-                }
-                .start()
         }
     }
 

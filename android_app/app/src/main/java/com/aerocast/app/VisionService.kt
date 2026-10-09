@@ -6,6 +6,7 @@ import android.os.Looper
 import android.util.Log
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.LifecycleOwner
 import com.google.mediapipe.framework.image.BitmapImageBuilder
@@ -19,9 +20,13 @@ import java.util.concurrent.Executors
 import kotlin.math.*
 
 /**
- * On-Demand MediaPipe Hand Vision Service for Android.
- * Front camera is activated strictly for a 5-second window upon staging or beacon receipt,
- * and released immediately upon detection or timeout to guarantee zero battery drain.
+ * On-Demand MediaPipe Hand Vision Service with Live CameraX Viewfinder.
+ * - 10-second gesture watch window.
+ * - Live Preview binding directly to PreviewView and GestureOverlayView.
+ * - Calibrated relaxed thresholds:
+ *   * Fist: Fingertips <= PIP * 1.10 (>=3 fingers curled)
+ *   * Palm: Fingertips >= MCP * 1.18 (>=4 fingers extended)
+ *   * Debounce: 2 consecutive frames for instant response.
  */
 class VisionService(private val context: Context) {
 
@@ -29,19 +34,22 @@ class VisionService(private val context: Context) {
         private const val TAG = "AeroCastVision"
         const val GESTURE_FIST = "GRAB"
         const val GESTURE_PALM = "DROP"
-        private const val DEBOUNCE_FRAMES = 3
-        private const val TIMEOUT_MS = 5000L // 5-second auto-release to prevent battery drain
+        private const val DEBOUNCE_FRAMES = 2
+        private const val TIMEOUT_MS = 10000L // 10-second full watch window
 
         // Landmark indices
         private const val WRIST = 0
+        private const val THUMB_CMC = 1
         private const val THUMB_MCP = 2
+        private const val THUMB_IP = 3
         private const val THUMB_TIP = 4
 
-        private val FINGER_PAIRS = listOf(
-            Pair(8, 5),   // Index Tip, Index MCP
-            Pair(12, 9),  // Middle Tip, Middle MCP
-            Pair(16, 13), // Ring Tip, Ring MCP
-            Pair(20, 17)  // Pinky Tip, Pinky MCP
+        // Triplets: (Tip, PIP, MCP)
+        private val FINGER_TRIPLETS = listOf(
+            Triple(8, 6, 5),   // Index
+            Triple(12, 10, 9), // Middle
+            Triple(16, 14, 13),// Ring
+            Triple(20, 18, 17) // Pinky
         )
     }
 
@@ -49,12 +57,14 @@ class VisionService(private val context: Context) {
         fun onGestureDetected(gesture: String)
         fun onTimeout()
         fun onProgress(streak: Int, required: Int, secondsLeft: Float)
+        fun onLandmarks(landmarks: List<NormalizedLandmark>?, gesture: String)
     }
 
     private var handLandmarker: HandLandmarker? = null
     private var cameraExecutor: ExecutorService = Executors.newSingleThreadExecutor()
     private var cameraProvider: ProcessCameraProvider? = null
     private var imageAnalysis: ImageAnalysis? = null
+    private var preview: Preview? = null
     private var callback: VisionCallback? = null
 
     private var targetGesture: String = GESTURE_PALM
@@ -76,8 +86,8 @@ class VisionService(private val context: Context) {
 
             val options = HandLandmarker.HandLandmarkerOptions.builder()
                 .setBaseOptions(baseOptions)
-                .setMinHandDetectionConfidence(0.65f)
-                .setMinTrackingConfidence(0.65f)
+                .setMinHandDetectionConfidence(0.50f)
+                .setMinTrackingConfidence(0.50f)
                 .setNumHands(1)
                 .setRunningMode(RunningMode.IMAGE)
                 .build()
@@ -90,10 +100,11 @@ class VisionService(private val context: Context) {
     }
 
     /**
-     * Wakes up front camera for at most 5 seconds to detect target gesture.
+     * Wakes up front camera for 10-second watch window with live preview rendering.
      */
     fun startGestureWatch(
         lifecycleOwner: LifecycleOwner,
+        previewView: PreviewView?,
         gesture: String, // GESTURE_FIST or GESTURE_PALM
         listener: VisionCallback
     ) {
@@ -105,10 +116,9 @@ class VisionService(private val context: Context) {
         isRunning = true
         startTimeMs = System.currentTimeMillis()
 
-        // Set 5-second auto-release timeout to prevent battery drain
         timeoutRunnable = Runnable {
             if (isRunning) {
-                Log.d(TAG, "Gesture window timed out after 5 seconds. Releasing camera.")
+                Log.d(TAG, "Gesture window timed out after 10s. Releasing camera.")
                 mainHandler.post { callback?.onTimeout() }
                 stopGestureWatch()
             }
@@ -119,7 +129,7 @@ class VisionService(private val context: Context) {
         cameraProviderFuture.addListener({
             try {
                 cameraProvider = cameraProviderFuture.get()
-                bindCamera(lifecycleOwner)
+                bindCamera(lifecycleOwner, previewView)
             } catch (e: Exception) {
                 Log.e(TAG, "CameraProvider binding failed: ${e.message}")
                 mainHandler.post { callback?.onTimeout() }
@@ -128,11 +138,10 @@ class VisionService(private val context: Context) {
         }, ContextCompat.getMainExecutor(context))
     }
 
-    private fun bindCamera(lifecycleOwner: LifecycleOwner) {
+    private fun bindCamera(lifecycleOwner: LifecycleOwner, previewView: PreviewView?) {
         val provider = cameraProvider ?: return
         provider.unbindAll()
 
-        // Prefer front camera, fallback gracefully if absent
         val cameraSelector = if (provider.hasCamera(CameraSelector.DEFAULT_FRONT_CAMERA)) {
             CameraSelector.DEFAULT_FRONT_CAMERA
         } else if (provider.hasCamera(CameraSelector.DEFAULT_BACK_CAMERA)) {
@@ -141,6 +150,14 @@ class VisionService(private val context: Context) {
             CameraSelector.DEFAULT_FRONT_CAMERA
         }
 
+        // 1. Live Viewfinder Preview use case
+        preview = Preview.Builder().build().also {
+            if (previewView != null) {
+                it.setSurfaceProvider(previewView.surfaceProvider)
+            }
+        }
+
+        // 2. High-speed analysis use case
         imageAnalysis = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
@@ -151,8 +168,12 @@ class VisionService(private val context: Context) {
         }
 
         try {
-            provider.bindToLifecycle(lifecycleOwner, cameraSelector, imageAnalysis)
-            Log.d(TAG, "Camera bound for on-demand gesture watch ($targetGesture).")
+            if (preview != null) {
+                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
+            } else {
+                provider.bindToLifecycle(lifecycleOwner, cameraSelector, imageAnalysis)
+            }
+            Log.d(TAG, "Camera bound for on-demand 10s gesture watch ($targetGesture).")
         } catch (e: Exception) {
             Log.e(TAG, "Camera bind to lifecycle failed: ${e.message}")
         }
@@ -199,92 +220,86 @@ class VisionService(private val context: Context) {
         val secondsLeft = max(0f, (TIMEOUT_MS - elapsed) / 1000f)
 
         mainHandler.post {
+            callback?.onLandmarks(landmarks, if (matched) targetGesture else "SEARCHING")
             callback?.onProgress(consecutiveStreak, DEBOUNCE_FRAMES, secondsLeft)
         }
 
         if (consecutiveStreak >= DEBOUNCE_FRAMES) {
-            Log.d(TAG, "Gesture $targetGesture CONFIRMED! Releasing camera immediately.")
+            Log.d(TAG, "Gesture $targetGesture CONFIRMED!")
             val confirmedGesture = targetGesture
             mainHandler.post {
                 callback?.onGestureDetected(confirmedGesture)
             }
-            stopGestureWatch()
         }
     }
 
     /**
-     * Fist Grab:
-     * All 4 fingertips (8, 12, 16, 20) Euclidean distance to Wrist (0)
-     * must be <= 0.85 relative to MCP joints (5, 9, 13, 17) to Wrist distance.
+     * Fist (Grab):
+     * Fingertips (8, 12, 16, 20) distance to wrist <= PIP distance * 1.10.
+     * Requires >= 3 curled fingers.
      */
     private fun checkFistGesture(landmarks: List<NormalizedLandmark>): Boolean {
         val wrist = landmarks[WRIST]
-        for (pair in FINGER_PAIRS) {
-            val tip = landmarks[pair.first]
-            val mcp = landmarks[pair.second]
+        var curledCount = 0
 
-            val dTip = dist3D(tip.x(), tip.y(), tip.z(), wrist.x(), wrist.y(), wrist.z())
-            val dMcp = dist3D(mcp.x(), mcp.y(), mcp.z(), wrist.x(), wrist.y(), wrist.z())
+        for (triplet in FINGER_TRIPLETS) {
+            val tip = landmarks[triplet.first]
+            val pip = landmarks[triplet.second]
+            val mcp = landmarks[triplet.third]
 
-            if (dMcp == 0f || (dTip / dMcp) > 0.85f) {
-                return false
+            val dTip = dist2D(tip.x(), tip.y(), wrist.x(), wrist.y())
+            val dPip = dist2D(pip.x(), pip.y(), wrist.x(), wrist.y())
+            val dMcp = dist2D(mcp.x(), mcp.y(), wrist.x(), wrist.y())
+
+            if ((dPip > 0f && dTip <= dPip * 1.10f) || (dMcp > 0f && dTip <= dMcp * 1.10f)) {
+                curledCount++
             }
         }
-        return true
+
+        // Thumb curl check
+        val thumbTip = landmarks[THUMB_TIP]
+        val thumbIp = landmarks[THUMB_IP]
+        val dThumbTip = dist2D(thumbTip.x(), thumbTip.y(), wrist.x(), wrist.y())
+        val dThumbIp = dist2D(thumbIp.x(), thumbIp.y(), wrist.x(), wrist.y())
+        if (dThumbIp > 0f && dThumbTip <= dThumbIp * 1.15f) {
+            curledCount++
+        }
+
+        return curledCount >= 3
     }
 
     /**
-     * Open Palm Drop:
-     * All 4 fingertips to Wrist distance >= 1.30 * MCP to Wrist distance.
-     * Thumb extended outward: angle between Landmark 4 and 2 relative to wrist >= 45 degrees.
+     * Open Palm (Drop):
+     * Fingertips (8, 12, 16, 20) distance to wrist >= MCP distance * 1.18.
+     * Requires >= 4 extended fingers.
      */
     private fun checkOpenPalmGesture(landmarks: List<NormalizedLandmark>): Boolean {
         val wrist = landmarks[WRIST]
+        var extendedCount = 0
 
-        // 4 fingers extension check
-        for (pair in FINGER_PAIRS) {
-            val tip = landmarks[pair.first]
-            val mcp = landmarks[pair.second]
+        for (triplet in FINGER_TRIPLETS) {
+            val tip = landmarks[triplet.first]
+            val mcp = landmarks[triplet.third]
 
-            val dTip = dist3D(tip.x(), tip.y(), tip.z(), wrist.x(), wrist.y(), wrist.z())
-            val dMcp = dist3D(mcp.x(), mcp.y(), mcp.z(), wrist.x(), wrist.y(), wrist.z())
+            val dTip = dist2D(tip.x(), tip.y(), wrist.x(), wrist.y())
+            val dMcp = dist2D(mcp.x(), mcp.y(), wrist.x(), wrist.y())
 
-            if (dMcp == 0f || (dTip / dMcp) < 1.30f) {
-                return false
+            if (dMcp > 0f && dTip >= dMcp * 1.18f) {
+                extendedCount++
             }
         }
 
-        // Thumb extension angle relative to wrist
-        val thumbMcp = landmarks[THUMB_MCP]
-        val thumbTip = landmarks[THUMB_TIP]
-
-        val v1x = thumbMcp.x() - wrist.x()
-        val v1y = thumbMcp.y() - wrist.y()
-        val v2x = thumbTip.x() - wrist.x()
-        val v2y = thumbTip.y() - wrist.y()
-
-        val angle = angleBetween2D(v1x, v1y, v2x, v2y)
-        return angle >= 45.0
+        return extendedCount >= 4
     }
 
-    private fun dist3D(x1: Float, y1: Float, z1: Float, x2: Float, y2: Float, z2: Float): Float {
+    private fun dist2D(x1: Float, y1: Float, x2: Float, y2: Float): Float {
         val dx = x1 - x2
         val dy = y1 - y2
-        val dz = z1 - z2
-        return sqrt(dx * dx + dy * dy + dz * dz)
-    }
-
-    private fun angleBetween2D(v1x: Float, v1y: Float, v2x: Float, v2y: Float): Double {
-        val dot = (v1x * v2x + v1y * v2y).toDouble()
-        val m1 = sqrt((v1x * v1x + v1y * v1y).toDouble())
-        val m2 = sqrt((v2x * v2x + v2y * v2y).toDouble())
-        if (m1 * m2 == 0.0) return 0.0
-        val cos = max(-1.0, min(1.0, dot / (m1 * m2)))
-        return Math.toDegrees(acos(cos))
+        return sqrt(dx * dx + dy * dy)
     }
 
     /**
-     * Cleanly stops camera session and releases hardware immediately.
+     * Stops camera session and releases hardware cleanly.
      */
     fun stopGestureWatch() {
         isRunning = false
