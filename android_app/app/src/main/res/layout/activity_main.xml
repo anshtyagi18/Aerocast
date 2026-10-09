@@ -7,7 +7,7 @@
     android:background="#070A12">
 
     <!-- 1. LIVE CAMERA VIEWFINDER & AR HUD SECTION -->
-    <androidx.cardview.widget.CardView
+    <com.google.android.material.card.MaterialCardView
         android:id="@+id/cardViewfinder"
         android:layout_width="0dp"
         android:layout_height="0dp"
@@ -15,6 +15,7 @@
         app:cardBackgroundColor="#0F172A"
         app:cardCornerRadius="24dp"
         app:cardElevation="8dp"
+        app:strokeWidth="0dp"
         app:layout_constraintBottom_toTopOf="@id/bottomDrawer"
         app:layout_constraintEnd_toEndOf="parent"
         app:layout_constraintStart_toStartOf="parent"
@@ -149,7 +150,7 @@
             </LinearLayout>
 
         </FrameLayout>
-    </androidx.cardview.widget.CardView>
+    </com.google.android.material.card.MaterialCardView>
 
     <!-- 2. BOTTOM CONTROL DRAWER & ACTIONS -->
     <androidx.constraintlayout.widget.ConstraintLayout

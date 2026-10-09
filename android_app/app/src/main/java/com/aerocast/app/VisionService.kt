@@ -151,28 +151,26 @@ class VisionService(private val context: Context) {
         }
 
         // 1. Live Viewfinder Preview use case
-        preview = Preview.Builder().build().also {
+        val previewUseCase = Preview.Builder().build().also {
             if (previewView != null) {
                 it.setSurfaceProvider(previewView.surfaceProvider)
             }
         }
+        this.preview = previewUseCase
 
         // 2. High-speed analysis use case
-        imageAnalysis = ImageAnalysis.Builder()
+        val analysisUseCase = ImageAnalysis.Builder()
             .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
             .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
             .build()
 
-        imageAnalysis?.setAnalyzer(cameraExecutor) { imageProxy ->
+        analysisUseCase.setAnalyzer(cameraExecutor) { imageProxy ->
             processImageProxy(imageProxy)
         }
+        this.imageAnalysis = analysisUseCase
 
         try {
-            if (preview != null) {
-                provider.bindToLifecycle(lifecycleOwner, cameraSelector, preview, imageAnalysis)
-            } else {
-                provider.bindToLifecycle(lifecycleOwner, cameraSelector, imageAnalysis)
-            }
+            provider.bindToLifecycle(lifecycleOwner, cameraSelector, previewUseCase, analysisUseCase)
             Log.d(TAG, "Camera bound for on-demand 10s gesture watch ($targetGesture).")
         } catch (e: Exception) {
             Log.e(TAG, "Camera bind to lifecycle failed: ${e.message}")

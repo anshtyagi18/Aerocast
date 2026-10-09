@@ -151,7 +151,12 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
 
     private fun handleShareIntent(intent: Intent?) {
         if (intent?.action == Intent.ACTION_SEND) {
-            val uri = intent.getParcelableExtra<Uri>(Intent.EXTRA_STREAM)
+            @Suppress("DEPRECATION")
+            val uri = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM, Uri::class.java)
+            } else {
+                intent.getParcelableExtra(Intent.EXTRA_STREAM)
+            }
             uri?.let { handleFileSelected(it) }
         }
     }

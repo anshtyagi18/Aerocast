@@ -11,3 +11,10 @@ bin/
 *.tmp
 thumbs.db
 .DS_Store
+
+# Android
+.gradle/
+build/
+app/build/
+*.apk
+local.properties

@@ -94,6 +94,9 @@ class GestureOverlayView @JvmOverloads constructor(
         postInvalidate()
     }
 
+    private fun getX(lm: NormalizedLandmark, viewWidth: Float): Float = (1.0f - lm.x()) * viewWidth
+    private fun getY(lm: NormalizedLandmark, viewHeight: Float): Float = lm.y() * viewHeight
+
     override fun onDraw(canvas: Canvas) {
         super.onDraw(canvas)
 
@@ -102,10 +105,6 @@ class GestureOverlayView @JvmOverloads constructor(
 
         val w = width.toFloat()
         val h = height.toFloat()
-
-        // Front camera coordinate mapping: horizontally mirrored
-        fun getX(lm: NormalizedLandmark): Float = (1.0f - lm.x()) * w
-        fun getY(lm: NormalizedLandmark): Float = lm.y() * h
 
         var minX = Float.MAX_VALUE
         var minY = Float.MAX_VALUE
@@ -117,18 +116,18 @@ class GestureOverlayView @JvmOverloads constructor(
             val p1 = currentLandmarks[conn.first]
             val p2 = currentLandmarks[conn.second]
 
-            val x1 = getX(p1)
-            val y1 = getY(p1)
-            val x2 = getX(p2)
-            val y2 = getY(p2)
+            val x1 = getX(p1, w)
+            val y1 = getY(p1, h)
+            val x2 = getX(p2, w)
+            val y2 = getY(p2, h)
 
             canvas.drawLine(x1, y1, x2, y2, linePaint)
         }
 
         // Draw landmark dots & track bounding box
         for (lm in currentLandmarks) {
-            val x = getX(lm)
-            val y = getY(lm)
+            val x = getX(lm, w)
+            val y = getY(lm, h)
 
             if (x < minX) minX = x
             if (x > maxX) maxX = x
