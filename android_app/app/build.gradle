@@ -9,24 +9,15 @@ android {
 
     defaultConfig {
         applicationId "com.aerocast.app"
-        minSdk 26
+        minSdk 29 // Android 10 (API 29), 11, 12, 13, 14, 15 full support
         targetSdk 34
         versionCode 1
         versionName "2.0.0"
 
         testInstrumentationRunner "androidx.test.runner.AndroidJUnitRunner"
-        
+
         ndk {
             abiFilters 'armeabi-v7a', 'arm64-v8a', 'x86_64'
-        }
-    }
-
-    signingConfigs {
-        debug {
-            storeFile file("${System.properties['user.home']}/.android/debug.keystore")
-            storePassword "android"
-            keyAlias "androiddebugkey"
-            keyPassword "android"
         }
     }
 
@@ -38,8 +29,7 @@ android {
         debug {
             minifyEnabled false
             debuggable true
-            // Ye line zaroori hai - bina iske phone package parse fail kar deta hai
-            signingConfig signingConfigs.debug
+            // Android 11+ ke liye v1 aur v2 signing standard debug config se automatic hoti hai
         }
     }
 
@@ -67,9 +57,6 @@ android {
                 '/META-INF/INDEX.LIST',
                 '/META-INF/io.netty.versions.properties'
             ]
-        }
-        jniLibs {
-            useLegacyPackaging = true
         }
     }
 }
