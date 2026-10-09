@@ -55,9 +55,25 @@ class NetworkManager(private val context: Context) {
         const val MSG_STAGE_ARMED = "ARMED_DROP"
         const val MSG_DROP_CONFIRMED = "DROP_CONFIRMED"
         const val MSG_FILE_HEADER = "FILE_HEADER"
-        const val EVENT_ARMED_DROP = "ARMED_DROP"
         const val SENDER_MOBILE = "MOBILE"
         const val SENDER_LAPTOP = "LAPTOP"
+
+        fun getSafeDownloadDir(context: Context): File {
+            try {
+                val pubDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AeroCast")
+                if (!pubDir.exists()) pubDir.mkdirs()
+                val test = File(pubDir, ".test_${System.currentTimeMillis()}")
+                if (test.createNewFile()) {
+                    test.delete()
+                    return pubDir
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Public downloads dir not writable (Scoped Storage): ${e.message}")
+            }
+            val appDir = File(context.getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS) ?: context.filesDir, "AeroCast")
+            if (!appDir.exists()) appDir.mkdirs()
+            return appDir
+        }
     }
 
     interface NetworkListener {
@@ -513,11 +529,25 @@ class NetworkManager(private val context: Context) {
     private fun handleIncomingTcpClient(socket: Socket) {
         scope.launch {
             try {
-                socket.soTimeout = 20000
-                val input = DataInputStream(socket.getInputStream())
-                val output = DataOutputStream(socket.getOutputStream())
+                socket.soTimeout = 25000
+                val rawIn = BufferedInputStream(socket.getInputStream())
+                val out = socket.getOutputStream()
 
-                // Read 17-byte standard frame: [12B Header] + [1B MsgType] + [4B PayloadLen]
+                rawIn.mark(1024)
+                val peekBuf = ByteArray(16)
+                val peekRead = rawIn.read(peekBuf)
+                rawIn.reset()
+
+                val peekStr = if (peekRead > 0) String(peekBuf, 0, peekRead, Charsets.UTF_8) else ""
+
+                if (peekStr.startsWith("GET ") || peekStr.startsWith("POST ") || peekStr.startsWith("HEAD ")) {
+                    handleHttpStream(socket, rawIn, out)
+                    return@launch
+                }
+
+                // Standard binary frame
+                val input = DataInputStream(rawIn)
+                val output = DataOutputStream(out)
                 val header = ByteArray(17)
                 input.readFully(header)
 
@@ -574,8 +604,7 @@ class NetworkManager(private val context: Context) {
                     val filename = meta.optString("filename", "received_${System.currentTimeMillis()}.bin")
                     val totalSize = meta.optLong("size", meta.optLong("filesize", 0L))
 
-                    val aeroCastDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AeroCast")
-                    if (!aeroCastDir.exists()) aeroCastDir.mkdirs()
+                    val aeroCastDir = getSafeDownloadDir(context)
                     val destFile = File(aeroCastDir, filename)
 
                     var receivedBytes = 0L
@@ -599,6 +628,11 @@ class NetworkManager(private val context: Context) {
                         fos.flush()
                     }
 
+                    if (totalSize > 0 && receivedBytes < totalSize) {
+                        destFile.delete()
+                        throw IOException("Raw TCP stream truncated: received $receivedBytes of $totalSize bytes")
+                    }
+
                     output.write("OK".toByteArray(Charsets.UTF_8))
                     output.flush()
                     unstageFile()
@@ -612,13 +646,180 @@ class NetworkManager(private val context: Context) {
         }
     }
 
+    private fun handleHttpStream(socket: Socket, rawIn: InputStream, out: OutputStream) {
+        val headerBytes = ByteArrayOutputStream()
+        val matchPattern = byteArrayOf('\r'.code.toByte(), '\n'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte())
+        var patternIdx = 0
+
+        while (true) {
+            val b = rawIn.read()
+            if (b == -1) break
+            headerBytes.write(b)
+            if (b.toByte() == matchPattern[patternIdx]) {
+                patternIdx++
+                if (patternIdx == 4) break
+            } else {
+                patternIdx = if (b.toByte() == matchPattern[0]) 1 else 0
+            }
+        }
+
+        val headerText = headerBytes.toString("UTF-8")
+        val lines = headerText.split("\r\n")
+        if (lines.isEmpty()) return
+        val reqLine = lines[0].split(" ")
+        if (reqLine.size < 2) return
+        val method = reqLine[0]
+        val path = reqLine[1]
+
+        var contentLength = 0L
+        var headerFilename = "received_${System.currentTimeMillis()}.bin"
+        for (line in lines) {
+            val colon = line.indexOf(":")
+            if (colon != -1) {
+                val key = line.substring(0, colon).trim().lowercase()
+                val value = line.substring(colon + 1).trim()
+                if (key == "content-length") {
+                    contentLength = value.toLongOrNull() ?: 0L
+                } else if (key == "x-filename" || key == "filename") {
+                    headerFilename = value
+                }
+            }
+        }
+
+        if (method == "GET") {
+            val fileToSend = stagedFile
+            if (fileToSend != null && fileToSend.exists()) {
+                val respHeaders = ("HTTP/1.1 200 OK\r\n" +
+                        "Content-Type: application/octet-stream\r\n" +
+                        "Content-Length: ${fileToSend.length()}\r\n" +
+                        "Content-Disposition: attachment; filename=\"${fileToSend.name}\"\r\n" +
+                        "X-Filename: ${fileToSend.name}\r\n" +
+                        "Access-Control-Allow-Origin: *\r\n" +
+                        "Connection: close\r\n\r\n").toByteArray(Charsets.UTF_8)
+                out.write(respHeaders)
+                out.flush()
+
+                val totalSize = fileToSend.length()
+                var sentBytes = 0L
+                val buffer = ByteArray(CHUNK_SIZE)
+                val startTime = System.currentTimeMillis()
+
+                FileInputStream(fileToSend).use { fis ->
+                    var read: Int
+                    while (fis.read(buffer).also { read = it } != -1) {
+                        out.write(buffer, 0, read)
+                        sentBytes += read
+                        if (totalSize > 0) {
+                            val pct = (sentBytes.toFloat() / totalSize.toFloat()) * 100f
+                            val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                            val speedMbps = (sentBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                            mainHandler.post { listener?.onTransferProgress(fileToSend.name, pct, speedMbps) }
+                        }
+                    }
+                    out.flush()
+                }
+
+                unstageFile()
+                mainHandler.post { listener?.onTransferComplete(fileToSend.name, fileToSend) }
+            } else {
+                val notFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n".toByteArray(Charsets.UTF_8)
+                out.write(notFound)
+                out.flush()
+            }
+        } else if (method == "POST") {
+            val destDir = getSafeDownloadDir(context)
+            val destFile = File(destDir, headerFilename)
+            var receivedBytes = 0L
+            val buffer = ByteArray(CHUNK_SIZE)
+            val startTime = System.currentTimeMillis()
+
+            FileOutputStream(destFile).use { fos ->
+                while (receivedBytes < contentLength) {
+                    val toRead = minOf(CHUNK_SIZE.toLong(), contentLength - receivedBytes).toInt()
+                    val count = rawIn.read(buffer, 0, toRead)
+                    if (count == -1) break
+                    fos.write(buffer, 0, count)
+                    receivedBytes += count
+                    if (contentLength > 0) {
+                        val pct = (receivedBytes.toFloat() / contentLength.toFloat()) * 100f
+                        val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                        val speedMbps = (receivedBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                        mainHandler.post { listener?.onTransferProgress(headerFilename, pct, speedMbps) }
+                    }
+                }
+                fos.flush()
+            }
+
+            if (contentLength > 0 && receivedBytes < contentLength) {
+                destFile.delete()
+                throw IOException("HTTP POST stream truncated: received $receivedBytes of $contentLength bytes")
+            }
+
+            val resp = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}".toByteArray(Charsets.UTF_8)
+            out.write(resp)
+            out.flush()
+
+            unstageFile()
+            mainHandler.post { listener?.onTransferComplete(headerFilename, destFile) }
+        }
+    }
+
     // ================= 4. TCP CLIENT (PULL FILE WITH BLUETOOTH FALLBACK) =================
     fun pullFileFromLaptop(laptopIp: String, port: Int, filename: String, expectedSize: Long) {
         scope.launch {
-            var socket: Socket? = null
             var success = false
 
-            // 1. Try High-Speed Wi-Fi TCP Stream
+            // 1. Primary: Quick Share HTTP GET /download
+            try {
+                val url = URL("http://$laptopIp:$port/download")
+                val conn = url.openConnection() as HttpURLConnection
+                conn.connectTimeout = 6000
+                conn.readTimeout = 45000
+                conn.requestMethod = "GET"
+                conn.setRequestProperty("User-Agent", "AeroCast-Android-Native")
+                conn.connect()
+
+                if (conn.responseCode == HttpURLConnection.HTTP_OK) {
+                    val totalSize = if (conn.contentLengthLong > 0) conn.contentLengthLong else expectedSize
+                    val destDir = getSafeDownloadDir(context)
+                    val destFile = File(destDir, filename)
+
+                    var receivedBytes = 0L
+                    val buffer = ByteArray(CHUNK_SIZE)
+                    val startTime = System.currentTimeMillis()
+
+                    conn.inputStream.use { input ->
+                        FileOutputStream(destFile).use { fos ->
+                            var count: Int
+                            while (input.read(buffer).also { count = it } != -1) {
+                                fos.write(buffer, 0, count)
+                                receivedBytes += count
+                                if (totalSize > 0) {
+                                    val pct = (receivedBytes.toFloat() / totalSize.toFloat()) * 100f
+                                    val elapsed = maxOf(1L, System.currentTimeMillis() - startTime)
+                                    val speedMbps = (receivedBytes.toFloat() / (elapsed / 1000f)) / (1024f * 1024f)
+                                    mainHandler.post { listener?.onTransferProgress(filename, pct, speedMbps) }
+                                }
+                            }
+                            fos.flush()
+                        }
+                    }
+
+                    if (totalSize > 0 && receivedBytes < totalSize) {
+                        destFile.delete()
+                        throw IOException("HTTP file stream truncated: received $receivedBytes of $totalSize bytes")
+                    }
+
+                    unstageFile()
+                    mainHandler.post { listener?.onTransferComplete(filename, destFile) }
+                    return@launch
+                }
+            } catch (e: Exception) {
+                Log.w(TAG, "Quick Share HTTP GET failed: ${e.message}. Falling back to raw TCP socket...")
+            }
+
+            // 2. Secondary: Raw Wi-Fi TCP Stream
+            var socket: Socket? = null
             try {
                 socket = Socket().apply {
                     connect(InetSocketAddress(laptopIp, port), 6000)
@@ -648,8 +849,7 @@ class NetworkManager(private val context: Context) {
                 val respJson = JSONObject(String(headerBytes, Charsets.UTF_8))
                 val totalSize = respJson.optLong("size", respJson.optLong("filesize", expectedSize))
 
-                val aeroCastDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AeroCast")
-                if (!aeroCastDir.exists()) aeroCastDir.mkdirs()
+                val aeroCastDir = getSafeDownloadDir(context)
                 val destFile = File(aeroCastDir, filename)
 
                 var receivedBytes = 0L
@@ -674,6 +874,11 @@ class NetworkManager(private val context: Context) {
                     fos.flush()
                 }
 
+                if (totalSize > 0 && receivedBytes < totalSize) {
+                    destFile.delete()
+                    throw IOException("Raw TCP stream truncated: received $receivedBytes of $totalSize bytes")
+                }
+
                 output.write("OK".toByteArray(Charsets.UTF_8))
                 output.flush()
                 unstageFile()
@@ -686,7 +891,7 @@ class NetworkManager(private val context: Context) {
                 try { socket?.close() } catch (e: Exception) {}
             }
 
-            // 2. Secondary Bluetooth RFCOMM Fallback
+            // 3. Bluetooth RFCOMM Fallback
             if (!success) {
                 pullFileOverBluetoothFallback(filename, expectedSize)
             }
@@ -727,8 +932,7 @@ class NetworkManager(private val context: Context) {
                 val respJson = JSONObject(String(headerBytes, Charsets.UTF_8))
                 val totalSize = respJson.optLong("size", respJson.optLong("filesize", expectedSize))
 
-                val aeroCastDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AeroCast")
-                if (!aeroCastDir.exists()) aeroCastDir.mkdirs()
+                val aeroCastDir = getSafeDownloadDir(context)
                 val destFile = File(aeroCastDir, filename)
 
                 var receivedBytes = 0L
@@ -751,6 +955,11 @@ class NetworkManager(private val context: Context) {
                         }
                     }
                     fos.flush()
+                }
+
+                if (totalSize > 0 && receivedBytes < totalSize) {
+                    destFile.delete()
+                    throw IOException("BT stream truncated: received $receivedBytes of $totalSize bytes")
                 }
 
                 output.write("OK".toByteArray(Charsets.UTF_8))

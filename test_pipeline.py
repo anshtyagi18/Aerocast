@@ -168,6 +168,64 @@ def test_explorer_hooks():
     assert os.path.exists(tray_script), "tray_app.py not found"
     print("  -> Explorer hooks tests PASSED.")
 
+def test_quickshare_http():
+    print("[TEST] 5. Quick Share HTTP Streaming (GET /download & POST /upload)...")
+    import urllib.request
+    from windows_agent.core.network_service import get_default_download_dir
+
+    svc = NetworkService()
+    svc.start()
+    time.sleep(0.5)
+
+    test_payload = b"AEROCAST_QUICK_SHARE_STREAM_PAYLOAD_TEST_" * 1024 # ~42KB
+    test_file = ROOT_DIR / "test_qs_tmp.bin"
+    with open(test_file, "wb") as f:
+        f.write(test_payload)
+
+    try:
+        # 1. Test GET /download
+        svc.stage_file(str(test_file))
+        time.sleep(0.3)
+
+        url = "http://127.0.0.1:42425/download"
+        req = urllib.request.Request(url, headers={"User-Agent": "AeroCast-Test"})
+        with urllib.request.urlopen(req, timeout=5.0) as resp:
+            downloaded = resp.read()
+            assert resp.status == 200, f"Expected 200 OK, got {resp.status}"
+            assert len(downloaded) == len(test_payload), f"Size mismatch: {len(downloaded)} vs {len(test_payload)}"
+            assert downloaded == test_payload, "Payload mismatch"
+            print("  -> Quick Share GET /download verified!")
+
+        # 2. Test POST /upload
+        upload_name = "test_qs_uploaded.bin"
+        post_req = urllib.request.Request(
+            "http://127.0.0.1:42425/upload",
+            data=test_payload,
+            headers={
+                "User-Agent": "AeroCast-Test",
+                "Content-Length": str(len(test_payload)),
+                "X-Filename": upload_name
+            },
+            method="POST"
+        )
+        with urllib.request.urlopen(post_req, timeout=5.0) as resp:
+            assert resp.status == 200
+            print("  -> Quick Share POST /upload verified!")
+
+        dest_file = get_default_download_dir() / upload_name
+        time.sleep(0.3)
+        assert dest_file.exists(), f"Uploaded file not found at {dest_file}"
+        with open(dest_file, "rb") as f:
+            uploaded_bytes = f.read()
+        assert uploaded_bytes == test_payload, "Uploaded content mismatch"
+        dest_file.unlink()
+        print("  -> Quick Share HTTP tests PASSED.")
+
+    finally:
+        svc.stop()
+        if test_file.exists():
+            test_file.unlink()
+
 if __name__ == "__main__":
     print("==================================================================")
     print("       AEROCAST FULL PIPELINE VERIFICATION SUITE")
@@ -176,6 +234,7 @@ if __name__ == "__main__":
     test_tcp_transmission()
     test_udp_discovery_and_staging()
     test_explorer_hooks()
+    test_quickshare_http()
     print("==================================================================")
     print("   ALL AEROCAST TESTS PASSED CLEANLY (ZERO FAILURES)")
     print("==================================================================")

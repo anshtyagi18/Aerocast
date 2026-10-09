@@ -21,7 +21,7 @@ from PyQt6.QtCore import (
 from PyQt6.QtWidgets import (
     QWidget, QHBoxLayout, QVBoxLayout, QLabel, QProgressBar, QGraphicsDropShadowEffect, QApplication
 )
-from PyQt6.QtGui import QColor, QFont, QCursor
+from PyQt6.QtGui import QColor, QFont, QCursor, QPixmap, QImage
 
 ASSETS_DIR = Path(__file__).resolve().parent.parent / "assets"
 
@@ -37,6 +37,126 @@ class HUDController(QObject):
     signal_progress_dots = pyqtSignal(int, int)         # streak, required
     signal_action_clicked = pyqtSignal()                # User clicked capsule to confirm action
     signal_dismiss_clicked = pyqtSignal()               # User clicked close button
+    signal_camera_frame = pyqtSignal(object, str, bool) # cv2 frame (numpy), mode ("DROP"/"GRAB"), matched (bool)
+
+
+class CameraViewfinderWindow(QWidget):
+    """
+    Floating companion camera viewfinder window shown during gesture watch.
+    Displays live webcam feed with MediaPipe hand landmarks and instant click confirmation.
+    """
+    def __init__(self, controller: HUDController, parent=None):
+        super().__init__(parent)
+        self.controller = controller
+        self.setWindowFlags(
+            Qt.WindowType.FramelessWindowHint |
+            Qt.WindowType.WindowStaysOnTopHint |
+            Qt.WindowType.Tool
+        )
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating, True)
+
+        self.view_width = 280
+        self.view_height = 205
+        self.resize(self.view_width, self.view_height)
+
+        self.container = QWidget(self)
+        self.container.setGeometry(0, 0, self.view_width, self.view_height)
+        self.container.setObjectName("ViewfinderContainer")
+        self.container.setStyleSheet("""
+            QWidget#ViewfinderContainer {
+                background: rgba(15, 23, 42, 0.95);
+                border: 2px solid #a855f7;
+                border-radius: 16px;
+            }
+        """)
+
+        # Drop shadow
+        self.shadow = QGraphicsDropShadowEffect(self)
+        self.shadow.setBlurRadius(24)
+        self.shadow.setColor(QColor(168, 85, 247, 100))
+        self.shadow.setOffset(0, 4)
+        self.container.setGraphicsEffect(self.shadow)
+
+        layout = QVBoxLayout(self.container)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
+
+        # Header with title and close button
+        header_layout = QHBoxLayout()
+        header_layout.setContentsMargins(4, 0, 4, 0)
+        self.lbl_title = QLabel("✋ Live Camera: Show Palm", self.container)
+        self.lbl_title.setStyleSheet("color: #e2e8f0; font-weight: bold; font-size: 11px; font-family: 'Segoe UI', sans-serif;")
+        header_layout.addWidget(self.lbl_title)
+
+        btn_close = QLabel("✕", self.container)
+        btn_close.setStyleSheet("color: #94a3b8; font-weight: bold; font-size: 12px; padding: 2px;")
+        btn_close.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        btn_close.mousePressEvent = lambda e: self.hide()
+        header_layout.addWidget(btn_close)
+        layout.addLayout(header_layout)
+
+        # Video frame display
+        self.video_label = QLabel(self.container)
+        self.video_label.setFixedSize(260, 140)
+        self.video_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.video_label.setStyleSheet("""
+            background: #000000;
+            border-radius: 10px;
+            border: 1px solid rgba(255, 255, 255, 0.20);
+        """)
+        layout.addWidget(self.video_label, alignment=Qt.AlignmentFlag.AlignCenter)
+
+        # Footer prompt
+        self.lbl_footer = QLabel("✋ Show hand or tap here to confirm", self.container)
+        self.lbl_footer.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.lbl_footer.setStyleSheet("color: #94a3b8; font-size: 9px; font-family: 'Segoe UI', sans-serif;")
+        layout.addWidget(self.lbl_footer)
+
+        self.container.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.container.mousePressEvent = lambda e: self.controller.signal_action_clicked.emit()
+
+        self.controller.signal_camera_frame.connect(self.on_frame_received)
+
+    def show_for_mode(self, mode: str):
+        border_color = "#a855f7" if mode == "DROP" else "#f59e0b"
+        shadow_color = QColor(168, 85, 247, 100) if mode == "DROP" else QColor(245, 158, 11, 100)
+        self.shadow.setColor(shadow_color)
+        self.container.setStyleSheet(f"""
+            QWidget#ViewfinderContainer {{
+                background: rgba(15, 23, 42, 0.95);
+                border: 2px solid {border_color};
+                border-radius: 16px;
+            }}
+        """)
+        if mode == "DROP":
+            self.lbl_title.setText("✋ Camera: Show Palm to Drop")
+            self.lbl_footer.setText("✋ Show palm or click here to receive")
+        else:
+            self.lbl_title.setText("✊ Camera: Make Fist to Cast")
+            self.lbl_footer.setText("✊ Make fist or click here to cast")
+
+        screen = QApplication.primaryScreen()
+        sw = screen.geometry().width() if screen else 1920
+        x = (sw - self.view_width) // 2
+        y = 20 + 54 + 10 # directly below capsule HUD
+        self.move(x, y)
+        self.show()
+        self.raise_()
+
+    def on_frame_received(self, cv_frame, mode: str, matched: bool):
+        if not self.isVisible() or cv_frame is None:
+            return
+        try:
+            import cv2
+            resized = cv2.resize(cv_frame, (260, 140))
+            rgb = cv2.cvtColor(resized, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            bytes_per_line = ch * w
+            q_img = QImage(rgb.data, w, h, bytes_per_line, QImage.Format.Format_RGB888).copy()
+            self.video_label.setPixmap(QPixmap.fromImage(q_img))
+        except Exception:
+            pass
 
 
 class DynamicCapsuleHUD(QWidget):
@@ -55,6 +175,7 @@ class DynamicCapsuleHUD(QWidget):
 
         self._init_window()
         self._init_ui()
+        self.viewfinder = CameraViewfinderWindow(self.controller)
         self._connect_signals()
 
     def _init_window(self):
@@ -246,6 +367,8 @@ class DynamicCapsuleHUD(QWidget):
         self._slide_anim.finished.connect(self.hide)
         self._slide_anim.start()
         self.is_visible_state = False
+        if hasattr(self, "viewfinder"):
+            self.viewfinder.hide()
 
     # ================= HUD EVENT STATES =================
     def show_armed_grab(self, filename: str, size: int):
@@ -274,11 +397,15 @@ class DynamicCapsuleHUD(QWidget):
         self.sub_label.setText(f"Make Fist (✊) or Click Here to Cast • {size_str}")
         self.progress_bar.hide()
         self.slide_in()
+        if hasattr(self, "viewfinder"):
+            self.viewfinder.show_for_mode("GRAB")
 
     def show_staged(self, filename: str):
         """
         Fist match confirmed on PC -> turns bright blue: "Staged! Finding Devices...".
         """
+        if hasattr(self, "viewfinder"):
+            self.viewfinder.hide()
         self.container.setStyleSheet("""
             QWidget#CapsuleContainer {
                 background: qlineargradient(x1:0, y1:0, x2:0, y2:1,
@@ -326,9 +453,13 @@ class DynamicCapsuleHUD(QWidget):
         self.progress_bar.hide()
         self._play_audio("grab.wav")
         self.slide_in()
+        if hasattr(self, "viewfinder"):
+            self.viewfinder.show_for_mode("DROP")
 
     def show_transferring(self, filename: str, progress_pct: float, speed_mbps: float = 0.0):
         """Shows active LAN or Bluetooth chunk streaming with live percentage and speed."""
+        if hasattr(self, "viewfinder"):
+            self.viewfinder.hide()
         display_name = filename if len(filename) <= 18 else filename[:15] + "..."
 
         self.container.setStyleSheet("""
@@ -360,6 +491,8 @@ class DynamicCapsuleHUD(QWidget):
         Transfer complete -> Turns Emerald Green with checkmark, plays drop.wav,
         fades out after 2.5s.
         """
+        if hasattr(self, "viewfinder"):
+            self.viewfinder.hide()
         display_name = filename if len(filename) <= 22 else filename[:19] + "..."
 
         self.container.setStyleSheet("""

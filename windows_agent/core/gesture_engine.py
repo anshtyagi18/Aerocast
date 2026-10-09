@@ -133,13 +133,60 @@ def check_open_palm_gesture(landmarks: Any) -> Tuple[bool, float]:
     return False, 0.0
 
 
+HAND_CONNECTIONS = [
+    (0, 1), (1, 2), (2, 3), (3, 4),        # Thumb
+    (0, 5), (5, 6), (6, 7), (7, 8),        # Index
+    (5, 9), (9, 10), (10, 11), (11, 12),    # Middle
+    (9, 13), (13, 14), (14, 15), (15, 16),  # Ring
+    (13, 17), (17, 18), (18, 19), (19, 20),# Pinky
+    (0, 17)                                # Palm base
+]
+
+
+def draw_hand_landmarks(frame, landmarks, matched: bool, mode: str):
+    """Draws augmented reality skeleton overlay on OpenCV frame."""
+    h, w = frame.shape[:2]
+    bone_color = (0, 230, 120) if matched else (255, 180, 50)
+    joint_color = (0, 255, 160) if matched else (255, 230, 80)
+
+    pts = []
+    for lm in landmarks:
+        x, y, _ = get_point(lm)
+        pts.append((int(x * w), int(y * h)))
+
+    for p1, p2 in HAND_CONNECTIONS:
+        if p1 < len(pts) and p2 < len(pts):
+            cv2.line(frame, pts[p1], pts[p2], bone_color, 2, cv2.LINE_AA)
+
+    for pt in pts:
+        cv2.circle(frame, pt, 4, joint_color, -1, cv2.LINE_AA)
+
+    # Top status overlay text
+    status_text = "CONFIRMED!" if matched else ("OPEN PALM" if mode == "DROP" else "MAKE FIST")
+    badge_bg = (0, 180, 80) if matched else (30, 30, 30)
+    cv2.rectangle(frame, (10, 10), (180, 36), badge_bg, -1)
+    cv2.putText(
+        frame,
+        status_text,
+        (18, 28),
+        cv2.FONT_HERSHEY_SIMPLEX,
+        0.55,
+        (255, 255, 255),
+        2,
+        cv2.LINE_AA
+    )
+
+
 class OnDemandGestureEngine:
     def __init__(self):
         self._thread: Optional[threading.Thread] = None
         self._stop_event = threading.Event()
         self._is_active = False
+        self._current_mode: Optional[str] = None
         self._detector = None
+        self._lock = threading.Lock()
         self._init_detector()
+
 
     def _init_detector(self):
         try:
@@ -204,12 +251,23 @@ class OnDemandGestureEngine:
         on_gesture: Optional[Callable[[str], None]] = None,
         on_timeout: Optional[Callable[[], None]] = None,
         on_progress: Optional[Callable[[int, int, float], None]] = None,
+        on_frame: Optional[Callable[[Any, str, bool], None]] = None,
     ):
-        self.stop()
-        self._stop_event.clear()
+        with self._lock:
+            # Prevent rapid camera re-opening if already running in requested mode
+            if self._is_active and self._current_mode == mode:
+                return
+
+            self._stop_event.set()
+            old_thread = self._thread
+            self._is_active = True
+            self._current_mode = mode
+            self._stop_event.clear()
+
+        if old_thread and old_thread.is_alive():
+            old_thread.join(timeout=0.6)
 
         def worker():
-            self._is_active = True
             cap = None
             consecutive_streak = 0
             start_time: Optional[float] = None
@@ -267,6 +325,12 @@ class OnDemandGestureEngine:
                     else:
                         consecutive_streak = 0
 
+                    if landmarks and len(landmarks) >= 21:
+                        draw_hand_landmarks(frame, landmarks, matched, mode)
+
+                    if on_frame:
+                        on_frame(frame.copy(), mode, matched)
+
                     if on_progress:
                         on_progress(consecutive_streak, DEBOUNCE_FRAMES, time_remaining)
 
@@ -286,16 +350,20 @@ class OnDemandGestureEngine:
                         cap.release()
                     except Exception:
                         pass
-                self._is_active = False
+                with self._lock:
+                    self._is_active = False
+                    self._current_mode = None
 
         self._thread = threading.Thread(target=worker, daemon=True, name="AeroCastVisionWorker")
         self._thread.start()
 
     def stop(self):
         self._stop_event.set()
+        with self._lock:
+            self._is_active = False
+            self._current_mode = None
         if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-        self._is_active = False
+            self._thread.join(timeout=0.6)
 
 
 try:
@@ -305,6 +373,7 @@ try:
         gesture_detected = pyqtSignal(str)
         watch_timeout = pyqtSignal()
         watch_progress = pyqtSignal(int, int, float)
+        frame_ready = pyqtSignal(object, str, bool)
 
         def __init__(self, parent=None):
             super().__init__(parent)
@@ -316,7 +385,8 @@ try:
             timeout: Optional[float] = None,
             on_gesture: Optional[Callable[[str], None]] = None,
             on_timeout: Optional[Callable[[], None]] = None,
-            on_progress: Optional[Callable[[int, int, float], None]] = None
+            on_progress: Optional[Callable[[int, int, float], None]] = None,
+            on_frame: Optional[Callable[[Any, str, bool], None]] = None
         ):
             def handle_gesture(m: str):
                 self.gesture_detected.emit(m)
@@ -333,12 +403,18 @@ try:
                 if on_progress:
                     on_progress(s, r, t)
 
+            def handle_frame(f, m, match):
+                self.frame_ready.emit(f, m, match)
+                if on_frame:
+                    on_frame(f, m, match)
+
             self._engine.start_watch(
                 mode=mode,
                 timeout=timeout,
                 on_gesture=handle_gesture,
                 on_timeout=handle_timeout,
-                on_progress=handle_progress
+                on_progress=handle_progress,
+                on_frame=handle_frame
             )
 
         def stop(self):

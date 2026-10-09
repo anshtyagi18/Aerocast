@@ -88,16 +88,14 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         }
 
         binding.btnOpenDownloads.setOnClickListener {
-            val aeroCastDir = File(Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS), "AeroCast")
-            if (!aeroCastDir.exists()) aeroCastDir.mkdirs()
-            val intent = Intent(Intent.ACTION_VIEW).apply {
-                setDataAndType(Uri.parse(aeroCastDir.absolutePath), "*/*")
-                flags = Intent.FLAG_ACTIVITY_NEW_TASK or Intent.FLAG_GRANT_READ_URI_PERMISSION
-            }
+            val aeroCastDir = NetworkManager.getSafeDownloadDir(this)
             try {
+                val intent = Intent(android.app.DownloadManager.ACTION_VIEW_DOWNLOADS).apply {
+                    flags = Intent.FLAG_ACTIVITY_NEW_TASK
+                }
                 startActivity(intent)
             } catch (e: Exception) {
-                Toast.makeText(this, "Downloads folder: Download/AeroCast", Toast.LENGTH_LONG).show()
+                Toast.makeText(this, "AeroCast folder: ${aeroCastDir.absolutePath}", Toast.LENGTH_LONG).show()
             }
         }
 
@@ -301,7 +299,7 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         visionService.stopGestureWatch()
         networkManager.unstageFile()
 
-        Toast.makeText(this, "Saved directly to Download/AeroCast/${savedFile.name}", Toast.LENGTH_LONG).show()
+        Toast.makeText(this, "Saved to AeroCast: ${savedFile.name}", Toast.LENGTH_LONG).show()
 
         Handler(Looper.getMainLooper()).postDelayed({
             updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "READY")

@@ -579,13 +579,18 @@ class NetworkService:
         self._tcp_thread.start()
 
     def _handle_tcp_client(self, conn: socket.socket, addr: Tuple[str, int]):
-        """Handles incoming TCP connections."""
+        """Handles incoming TCP connections supporting Quick Share HTTP streaming & binary framing."""
         conn.settimeout(25.0)
         try:
-            # Read 17-byte standard frame header
+            # Read first 17 bytes (or initial chunk) to determine protocol
             header = self._recv_all(conn, 17)
             if not header:
                 conn.close()
+                return
+
+            # Check if client sent standard HTTP request (Quick Share backend)
+            if header.startswith(b"GET ") or header.startswith(b"POST ") or header.startswith(b"HEAD "):
+                self._handle_http_request(conn, addr, header)
                 return
 
             magic = header[:12]
@@ -627,6 +632,108 @@ class NetworkService:
                 conn.close()
             except Exception:
                 pass
+
+    def _handle_http_request(self, conn: socket.socket, addr: Tuple[str, int], initial_bytes: bytes):
+        """Quick Share style lightweight HTTP REST file streamer (GET /download & POST /upload)."""
+        data = initial_bytes
+        while b"\r\n\r\n" not in data and len(data) < 16384:
+            chunk = conn.recv(1024)
+            if not chunk:
+                break
+            data += chunk
+
+        idx = data.find(b"\r\n\r\n")
+        if idx == -1:
+            conn.close()
+            return
+
+        header_bytes = data[:idx]
+        body_initial = data[idx + 4:]
+        lines = header_bytes.decode("utf-8", errors="replace").split("\r\n")
+        req_line = lines[0].split()
+        if len(req_line) < 2:
+            conn.close()
+            return
+
+        method, path = req_line[0], req_line[1]
+
+        # 1. HTTP GET (Download staged file)
+        if method == "GET":
+            with self._staged_lock:
+                staged = self._staged_file
+            if staged and staged.is_file():
+                filesize = staged.stat().st_size
+                filename = staged.name
+                headers = (
+                    f"HTTP/1.1 200 OK\r\n"
+                    f"Content-Type: application/octet-stream\r\n"
+                    f"Content-Length: {filesize}\r\n"
+                    f"Content-Disposition: attachment; filename=\"{filename}\"\r\n"
+                    f"X-Filename: {filename}\r\n"
+                    f"Access-Control-Allow-Origin: *\r\n"
+                    f"Connection: close\r\n\r\n"
+                ).encode("utf-8")
+                conn.sendall(headers)
+
+                sent = 0
+                start_time = time.time()
+                with open(staged, "rb") as f:
+                    while chunk := f.read(CHUNK_SIZE):
+                        conn.sendall(chunk)
+                        sent += len(chunk)
+                        if filesize > 0:
+                            pct = (sent / filesize) * 100.0
+                            elapsed = max(0.001, time.time() - start_time)
+                            speed = (sent / elapsed) / (1024 * 1024)
+                            self._emit_progress(filename, pct, speed)
+
+                self.unstage_file()
+                if self.on_transfer_complete:
+                    self.on_transfer_complete(filename, str(staged))
+            else:
+                conn.sendall(b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n")
+
+        # 2. HTTP POST (Upload file from mobile)
+        elif method == "POST":
+            content_len = 0
+            filename = f"aerocast_{int(time.time())}.bin"
+            for line in lines[1:]:
+                if ":" in line:
+                    k, v = line.split(":", 1)
+                    k, v = k.strip().lower(), v.strip()
+                    if k == "content-length":
+                        content_len = int(v)
+                    elif k in ("x-filename", "x-file-name", "filename"):
+                        filename = v
+
+            dest_dir = get_default_download_dir()
+            dest_path = dest_dir / filename
+            received = len(body_initial)
+            start_time = time.time()
+
+            with open(dest_path, "wb") as f:
+                if body_initial:
+                    f.write(body_initial)
+                while received < content_len:
+                    to_read = min(CHUNK_SIZE, content_len - received)
+                    chunk = conn.recv(to_read)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+                    received += len(chunk)
+                    if content_len > 0:
+                        pct = (received / content_len) * 100.0
+                        elapsed = max(0.001, time.time() - start_time)
+                        speed = (received / elapsed) / (1024 * 1024)
+                        self._emit_progress(filename, pct, speed)
+
+            resp = b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 15\r\n\r\n{\"status\":\"ok\"}"
+            conn.sendall(resp)
+
+            if self.file_received:
+                self.file_received(filename, str(dest_path))
+            elif self.on_transfer_complete:
+                self.on_transfer_complete(filename, str(dest_path))
 
     def _receive_file_stream(self, conn: socket.socket, meta: Dict[str, Any], is_bluetooth: bool = False):
         """
@@ -856,6 +963,46 @@ class NetworkService:
     ):
         """Connects to sender to pull staged file after Open Palm gesture."""
         def worker():
+            dest_dir = get_default_download_dir()
+            dest_path = dest_dir / filename
+
+            # 1. Primary: Quick Share HTTP GET /download
+            try:
+                import urllib.request
+                url = f"http://{sender_ip}:{port}/download"
+                req = urllib.request.Request(url, headers={"User-Agent": "AeroCast-Windows-Native"})
+                with urllib.request.urlopen(req, timeout=8.0) as resp:
+                    if resp.status == 200:
+                        total_size = int(resp.headers.get("Content-Length", expected_size))
+                        received_bytes = 0
+                        start_time = time.time()
+                        with open(dest_path, "wb") as f:
+                            while True:
+                                chunk = resp.read(CHUNK_SIZE)
+                                if not chunk:
+                                    break
+                                f.write(chunk)
+                                received_bytes += len(chunk)
+                                if total_size > 0:
+                                    pct = (received_bytes / total_size) * 100.0
+                                    elapsed = max(0.001, time.time() - start_time)
+                                    speed = (received_bytes / elapsed) / (1024 * 1024)
+                                    self._emit_progress(filename, pct, speed)
+
+                        if total_size > 0 and received_bytes != total_size:
+                            dest_path.unlink(missing_ok=True)
+                            raise IOError(f"HTTP stream truncated: received {received_bytes}/{total_size}")
+
+                        print(f"[AeroCast Net] Successfully pulled {filename} via Quick Share HTTP!")
+                        if self.file_received:
+                            self.file_received(filename, dest_path)
+                        elif self.on_transfer_complete:
+                            self.on_transfer_complete(filename, dest_path)
+                        return
+            except Exception as e_http:
+                print(f"[AeroCast Net] HTTP pull failed: {e_http}, trying raw TCP socket...", file=sys.stderr)
+
+            # 2. Secondary: Raw TCP socket pull
             sock = None
             try:
                 sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -906,6 +1053,7 @@ class NetworkService:
                             self._emit_progress(filename, pct, speed_mbps)
 
                 if total_size > 0 and received_bytes != total_size:
+                    dest_path.unlink(missing_ok=True)
                     raise IOError(f"Truncated stream: received {received_bytes}/{total_size}")
 
                 sock.sendall(b"OK")

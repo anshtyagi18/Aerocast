@@ -118,6 +118,9 @@ class AeroCastTrayApp:
         self.hud_controller.signal_dismiss_clicked.connect(
             self._handle_hud_dismiss_clicked
         )
+        self.gesture_engine.frame_ready.connect(
+            self.hud_controller.signal_camera_frame
+        )
 
         # Helper for progress signal
         def on_prog(fn, pct, speed=0.0):
@@ -340,6 +343,9 @@ class AeroCastTrayApp:
         if not os.path.isfile(filepath):
             return
 
+        if self._staged_local_file == filepath and self.gesture_engine.is_active:
+            return
+
         self._staged_local_file = filepath
         path = Path(filepath)
         filename = path.name
@@ -385,6 +391,10 @@ class AeroCastTrayApp:
         size = int(packet.get("size", packet.get("filesize", 0)))
         sender_ip = packet.get("sender_ip", "")
         tcp_port = packet.get("tcp_port", TCP_TRANSFER_PORT)
+
+        # Guard against repeating 1s UDP beacons restarting the camera continuously
+        if self._active_incoming_meta and self._active_incoming_meta.get("filename") == filename:
+            return
 
         self._active_incoming_meta = packet
 
