@@ -35,7 +35,6 @@ class VisionService(private val context: Context) {
         const val GESTURE_FIST = "GRAB"
         const val GESTURE_PALM = "DROP"
         private const val DEBOUNCE_FRAMES = 2
-        private const val TIMEOUT_MS = 10000L // 10-second full watch window
 
         // Landmark indices
         private const val WRIST = 0
@@ -116,15 +115,6 @@ class VisionService(private val context: Context) {
         isRunning = true
         startTimeMs = System.currentTimeMillis()
 
-        timeoutRunnable = Runnable {
-            if (isRunning) {
-                Log.d(TAG, "Gesture window timed out after 10s. Releasing camera.")
-                mainHandler.post { callback?.onTimeout() }
-                stopGestureWatch()
-            }
-        }
-        mainHandler.postDelayed(timeoutRunnable!!, TIMEOUT_MS)
-
         val cameraProviderFuture = ProcessCameraProvider.getInstance(context)
         cameraProviderFuture.addListener({
             try {
@@ -171,7 +161,7 @@ class VisionService(private val context: Context) {
 
         try {
             provider.bindToLifecycle(lifecycleOwner, cameraSelector, previewUseCase, analysisUseCase)
-            Log.d(TAG, "Camera bound for on-demand 10s gesture watch ($targetGesture).")
+            Log.d(TAG, "Camera bound for continuous gesture watch ($targetGesture).")
         } catch (e: Exception) {
             Log.e(TAG, "Camera bind to lifecycle failed: ${e.message}")
         }
@@ -214,12 +204,9 @@ class VisionService(private val context: Context) {
             consecutiveStreak = 0
         }
 
-        val elapsed = System.currentTimeMillis() - startTimeMs
-        val secondsLeft = max(0f, (TIMEOUT_MS - elapsed) / 1000f)
-
         mainHandler.post {
             callback?.onLandmarks(landmarks, if (matched) targetGesture else "SEARCHING")
-            callback?.onProgress(consecutiveStreak, DEBOUNCE_FRAMES, secondsLeft)
+            callback?.onProgress(consecutiveStreak, DEBOUNCE_FRAMES, 0f)
         }
 
         if (consecutiveStreak >= DEBOUNCE_FRAMES) {

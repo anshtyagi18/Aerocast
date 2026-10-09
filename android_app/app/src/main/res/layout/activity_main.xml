@@ -84,7 +84,7 @@
                     android:background="#3338BDF8"
                     android:paddingHorizontal="6dp"
                     android:paddingVertical="2dp"
-                    android:text="10s"
+                    android:text="READY"
                     android:textColor="#38BDF8"
                     android:textSize="11sp"
                     android:textStyle="bold" />

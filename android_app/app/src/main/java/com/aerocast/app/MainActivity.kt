@@ -113,7 +113,7 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
             triggerPalmReceive()
         }
 
-        updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "10s")
+        updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "READY")
     }
 
     private fun checkPermissions() {
@@ -178,9 +178,9 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         binding.btnManualReceive.visibility = View.GONE
 
         // Update floating pill badge to Amber
-        updatePillBadge("✊", "MAKE A FIST TO CAST", "#F59E0B", "10s")
+        updatePillBadge("✊", "MAKE A FIST TO CAST", "#F59E0B", "ARMED")
 
-        // Start 10-second front camera watch for Fist Grab with live viewfinder
+        // Start front camera watch for Fist Grab with live viewfinder (continuous)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             visionService.startGestureWatch(this, binding.cameraPreview, VisionService.GESTURE_FIST, this)
         } else {
@@ -221,9 +221,9 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         binding.btnManualSend.visibility = View.GONE
 
         // Update floating pill badge to Purple
-        updatePillBadge("✋", "OPEN PALM TO RECEIVE", "#A855F7", "10s")
+        updatePillBadge("✋", "OPEN PALM TO RECEIVE", "#A855F7", "READY")
 
-        // Start 10-second front camera watch for Open Palm Drop
+        // Start front camera watch for Open Palm Drop (continuous)
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA) == PackageManager.PERMISSION_GRANTED) {
             visionService.startGestureWatch(this, binding.cameraPreview, VisionService.GESTURE_PALM, this)
         } else {
@@ -266,7 +266,7 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
     }
 
     override fun onProgress(streak: Int, required: Int, secondsLeft: Float) {
-        val badge = if (streak > 0) "$streak/$required" else "${secondsLeft.toInt()}s"
+        val badge = if (streak > 0) "$streak/$required" else "LIVE"
         binding.pillTimerBadge.text = badge
     }
 
@@ -297,13 +297,14 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         binding.manualActionRow.visibility = View.GONE
         binding.gestureOverlay.clear()
 
-        // Release camera cleanly after file complete and handshake
+        // Release camera cleanly and unstage after file complete
         visionService.stopGestureWatch()
+        networkManager.unstageFile()
 
         Toast.makeText(this, "Saved directly to Download/AeroCast/${savedFile.name}", Toast.LENGTH_LONG).show()
 
         Handler(Looper.getMainLooper()).postDelayed({
-            updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "10s")
+            updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "READY")
         }, 3000)
     }
 
@@ -312,6 +313,7 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         binding.transferOverlayContainer.visibility = View.GONE
         binding.gestureOverlay.clear()
         visionService.stopGestureWatch()
+        networkManager.unstageFile()
         Toast.makeText(this, error, Toast.LENGTH_SHORT).show()
         updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "ERR")
     }
@@ -321,11 +323,12 @@ class MainActivity : AppCompatActivity(), VisionService.VisionCallback, NetworkM
         stagedFile = null
         activeIncomingLaptopIp = null
         visionService.stopGestureWatch()
+        networkManager.unstageFile()
         binding.gestureOverlay.clear()
         binding.cardFileBadge.visibility = View.GONE
         binding.manualActionRow.visibility = View.GONE
         binding.transferOverlayContainer.visibility = View.GONE
-        updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "10s")
+        updatePillBadge("🔍", "Looking for Hand Gesture…", "#94A3B8", "READY")
     }
 
     private fun updatePillBadge(icon: String, text: String, colorHex: String, timerText: String) {

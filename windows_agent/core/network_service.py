@@ -162,10 +162,23 @@ class NetworkService:
         self._start_tcp_server()
         self._start_bluetooth_server()
         self._start_ipc_server()
+        self._start_discovery_loop()
+
+    def _start_discovery_loop(self):
+        """Periodically announces presence on LAN so both devices constantly know each other's IP."""
+        def worker():
+            while self._running:
+                try:
+                    self.broadcast_discovery()
+                except Exception:
+                    pass
+                time.sleep(3.5)
+        threading.Thread(target=worker, daemon=True, name="AeroCastDiscoveryLoop").start()
 
     def stop(self):
         """Stops all background listeners cleanly."""
         self._running = False
+        self.unstage_file()
         for s in (self._udp_sock, self._tcp_server, self._bt_server, self._ipc_server):
             if s:
                 try:
@@ -270,7 +283,7 @@ class NetworkService:
         file_hash: Optional[str] = None,
         extra: Optional[Dict[str, Any]] = None
     ):
-        """Broadcasts a UDP beacon to the subnet."""
+        """Broadcasts a UDP beacon to the subnet and directly to known peer IPs."""
         try:
             sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
             sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
@@ -287,8 +300,16 @@ class NetworkService:
                 rfcomm_port=self.rfcomm_port,
                 extra=extra
             )
+            # 1. Subnet broadcast and generic 255.255.255.255
             sock.sendto(data, (bcast_ip, UDP_BEACON_PORT))
             sock.sendto(data, ("255.255.255.255", UDP_BEACON_PORT))
+
+            # 2. Direct Unicast to all discovered peer IPs (bypasses router AP isolation completely)
+            for peer_ip in list(self.discovered_peers.keys()):
+                try:
+                    sock.sendto(data, (peer_ip, UDP_BEACON_PORT))
+                except Exception:
+                    pass
             sock.close()
         except Exception as e:
             print(f"[AeroCast Net] Broadcast error: {e}", file=sys.stderr)
@@ -297,10 +318,10 @@ class NetworkService:
         """Broadcasts discovery beacon to locate peers on LAN."""
         self.broadcast_beacon(event=MSG_DISCOVERY_BEACON)
 
-    def broadcast_armed_drop_laptop(self, filepath: str) -> bool:
+    def stage_file(self, filepath: str) -> bool:
         """
-        Stages a file on laptop and broadcasts MSG_STAGE_ARMED beacon.
-        Initiates simultaneous Bluetooth RFCOMM fallback if UDP is unacknowledged within 1.5s.
+        Stages a local file and launches continuous background beaconing.
+        Alerts Mobile repeatedly every 1s until file transfer completes or is cancelled.
         """
         path = Path(filepath)
         if not path.is_file():
@@ -315,23 +336,41 @@ class NetworkService:
 
         self._stage_ack_received.clear()
 
-        # 1. Primary Wi-Fi UDP Broadcast
-        self.broadcast_beacon(
-            event=MSG_STAGE_ARMED,
-            filename=path.name,
-            size=filesize,
-            file_hash=file_hash
-        )
+        def beacon_worker():
+            print(f"[AeroCast Net] Staged '{path.name}' ({filesize} B). Starting continuous broadcast...")
+            # Trigger Bluetooth fallback check once in background
+            threading.Thread(
+                target=self._bluetooth_fallback_check,
+                args=(path.name, filesize, file_hash),
+                daemon=True,
+                name="AeroCastBTFallback"
+            ).start()
 
-        # 2. Asynchronous Bluetooth RFCOMM Fallback Timer (1.5 seconds)
-        threading.Thread(
-            target=self._bluetooth_fallback_check,
-            args=(path.name, filesize, file_hash),
-            daemon=True,
-            name="AeroCastBTFallback"
-        ).start()
+            while self._running:
+                with self._staged_lock:
+                    if self._staged_file != path:
+                        break
+                self.broadcast_beacon(
+                    event=MSG_STAGE_ARMED,
+                    filename=path.name,
+                    size=filesize,
+                    file_hash=file_hash
+                )
+                time.sleep(1.0)
 
+        self._beacon_thread = threading.Thread(target=beacon_worker, daemon=True, name="AeroCastBeaconRepeat")
+        self._beacon_thread.start()
         return True
+
+    def unstage_file(self):
+        """Cancels active staged file and stops repeating beacon broadcasts."""
+        with self._staged_lock:
+            self._staged_file = None
+            self._staged_hash = None
+
+    def broadcast_armed_drop_laptop(self, filepath: str) -> bool:
+        """Legacy alias - stages file and starts continuous beaconing."""
+        return self.stage_file(filepath)
 
     def _bluetooth_fallback_check(self, filename: str, filesize: int, file_hash: str):
         """
@@ -541,36 +580,27 @@ class NetworkService:
 
     def _handle_tcp_client(self, conn: socket.socket, addr: Tuple[str, int]):
         """Handles incoming TCP connections."""
-        conn.settimeout(20.0)
+        conn.settimeout(25.0)
         try:
-            # Check magic header
-            magic = conn.recv(12)
+            # Read 17-byte standard frame header
+            header = self._recv_all(conn, 17)
+            if not header:
+                conn.close()
+                return
+
+            magic = header[:12]
             if magic not in (MAGIC_HEADER, MAGIC_HEADER_V1, MAGIC_HEADER_LEGACY, b"AERO_CAST_V1"):
                 conn.close()
                 return
 
-            # Check next byte: either 1B msg_type or start of 4B length
-            peek = conn.recv(1)
-            if not peek:
-                conn.close()
-                return
-
-            # Read remaining bytes for length
-            rest_len = self._recv_all(conn, 4)
-            if not rest_len:
-                conn.close()
-                return
-
-            # Combine to determine if 17B header or legacy 16B header
-            # Try unpacking 4-byte big endian from rest_len
-            meta_len = int.from_bytes(rest_len, byteorder="big")
-            meta_bytes = self._recv_all(conn, meta_len)
-            if not meta_bytes:
-                # Try combining peek + rest_len[:3]
-                alt_len = int.from_bytes(peek + rest_len[:3], byteorder="big")
-                if alt_len < 100000:
-                    meta_bytes = rest_len[3:] + (self._recv_all(conn, alt_len - 1) or b"")
-                    meta_len = alt_len
+            msg_type = header[12]
+            meta_len = int.from_bytes(header[13:17], byteorder="big")
+            if meta_len > 1_000_000:
+                # 16-byte fallback
+                meta_len = int.from_bytes(header[12:16], byteorder="big")
+                meta_bytes = header[16:17] + (self._recv_all(conn, meta_len - 1) or b"")
+            else:
+                meta_bytes = self._recv_all(conn, meta_len)
 
             if not meta_bytes:
                 conn.close()
@@ -584,6 +614,9 @@ class NetworkService:
                     staged_path = self._staged_file
                 if staged_path and staged_path.exists():
                     self._send_file_stream(conn, staged_path, is_bluetooth=False)
+                    self.unstage_file()
+                else:
+                    print(f"[AeroCast Net] Received PULL from {addr} but no file staged", file=sys.stderr)
             else:
                 self._receive_file_stream(conn, meta, is_bluetooth=False)
 

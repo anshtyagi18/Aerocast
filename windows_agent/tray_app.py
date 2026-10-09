@@ -112,6 +112,12 @@ class AeroCastTrayApp:
         self.bridge.signal_exit.connect(
             self._exit_app, Qt.ConnectionType.QueuedConnection
         )
+        self.hud_controller.signal_action_clicked.connect(
+            self._handle_hud_action_clicked
+        )
+        self.hud_controller.signal_dismiss_clicked.connect(
+            self._handle_hud_dismiss_clicked
+        )
 
         # Helper for progress signal
         def on_prog(fn, pct, speed=0.0):
@@ -326,10 +332,10 @@ class AeroCastTrayApp:
     def stage_file_for_grab(self, filepath: str):
         """
         User right-clicked file or clicked Send:
-        1. Dynamic capsule pops down immediately: "✊ Grab to Cast: [Filename]" (Yellow Accent).
-        2. Camera opens for full 10-second window.
-        3. Upon Fist match: turns bright blue: "Staged! Finding Devices...",
-           broadcasts stage beacon via Wi-Fi and Bluetooth.
+        1. Immediately stages file in NetworkService and begins continuous repeating broadcast.
+        2. Dynamic capsule pops down: "✊ Grab or Click to Cast: [Filename]".
+        3. Camera opens indefinitely (no 10-second timeout) until transfer completes or user cancels.
+        4. Fist gesture OR clicking HUD confirms grab and broadcasts.
         """
         if not os.path.isfile(filepath):
             return
@@ -339,29 +345,27 @@ class AeroCastTrayApp:
         filename = path.name
         filesize = path.stat().st_size
 
-        # Show Yellow Accent HUD
+        # 1. Immediately begin continuous beacon broadcasting to all devices
+        if self.network_service:
+            self.network_service.stage_file(filepath)
+
+        # 2. Show Yellow Accent HUD immediately
         self.hud_controller.signal_armed_grab.emit(filename, filesize)
 
         def on_fist_detected(mode: str):
-            print(f"[AeroCast] Fist Grab confirmed! Staged '{filename}'. Broadcasting...")
+            print(f"[AeroCast] Fist Grab confirmed for '{filename}'!")
             self._play_chime("grab.wav")
-            # Update HUD to Bright Blue Staged
             self.hud_controller.signal_staged.emit(filename)
-            if self.network_service:
-                self.network_service.broadcast_armed_drop_laptop(filepath)
-
-        def on_timeout():
-            print("[AeroCast] Fist grab watch window timed out.")
-            self.hud_controller.signal_hide.emit()
 
         def on_progress(streak, required, time_left):
             self.hud_controller.signal_progress_dots.emit(streak, required)
 
+        # Runs indefinitely until transfer finishes or stopped
         self.gesture_engine.start_watch(
             mode="GRAB",
-            timeout=GESTURE_TIMEOUT_SECONDS, # 10.0 seconds
+            timeout=None,
             on_gesture=on_fist_detected,
-            on_timeout=on_timeout,
+            on_timeout=None,
             on_progress=on_progress
         )
 
@@ -370,10 +374,9 @@ class AeroCastTrayApp:
         """
         Phone staged a file in the air (Incoming to PC):
         1. Laptop capsule pops down immediately on top of all windows:
-           "📥 Incoming: [Filename] - ✋ Show Palm to Drop" (Purple Accent).
-        2. Camera opens for full 10-second window.
-        3. Upon Palm match: pulls stream via TCP or Bluetooth fallback,
-           shows live percentage and speed bar in capsule, saves to Downloads/AeroCast.
+           "📥 Incoming: [Filename] • ✋ Show Palm (✋) or Click Here to Drop".
+        2. Camera opens indefinitely until transfer completes or user cancels.
+        3. Palm gesture OR clicking HUD pulls stream via TCP or Bluetooth fallback.
         """
         if not self._monitoring_enabled:
             return
@@ -399,20 +402,48 @@ class AeroCastTrayApp:
                     expected_size=size
                 )
 
-        def on_timeout():
-            print("[AeroCast] Drop gesture watch window timed out.")
-            self.hud_controller.signal_hide.emit()
-
         def on_progress(streak, required, time_left):
             self.hud_controller.signal_progress_dots.emit(streak, required)
 
+        # Runs indefinitely until transfer finishes or stopped
         self.gesture_engine.start_watch(
             mode="DROP",
-            timeout=GESTURE_TIMEOUT_SECONDS, # 10.0 seconds
+            timeout=None,
             on_gesture=on_palm_detected,
-            on_timeout=on_timeout,
+            on_timeout=None,
             on_progress=on_progress
         )
+
+    def _handle_hud_action_clicked(self):
+        """User clicked the floating capsule HUD to confirm action without gesture."""
+        if self._active_incoming_meta:
+            filename = self._active_incoming_meta.get("filename", "received_file")
+            size = int(self._active_incoming_meta.get("size", self._active_incoming_meta.get("filesize", 0)))
+            sender_ip = self._active_incoming_meta.get("sender_ip", "")
+            tcp_port = self._active_incoming_meta.get("tcp_port", TCP_TRANSFER_PORT)
+            print(f"[AeroCast] HUD click confirmed incoming drop for '{filename}'")
+            self._play_chime("grab.wav")
+            if self.network_service and sender_ip:
+                self.network_service.pull_file_from_sender(
+                    sender_ip=sender_ip,
+                    port=tcp_port,
+                    filename=filename,
+                    expected_size=size
+                )
+        elif self._staged_local_file:
+            path = Path(self._staged_local_file)
+            print(f"[AeroCast] HUD click confirmed stage for '{path.name}'")
+            self._play_chime("grab.wav")
+            self.hud_controller.signal_staged.emit(path.name)
+
+    def _handle_hud_dismiss_clicked(self):
+        """User clicked the close button on the HUD."""
+        print("[AeroCast] Session cancelled by user.")
+        self.gesture_engine.stop()
+        if self.network_service:
+            self.network_service.unstage_file()
+        self._staged_local_file = ""
+        self._active_incoming_meta = None
 
     def _handle_drop_confirmed(self, packet: dict):
         """Mobile detected drop gesture and signaled DROP_CONFIRMED."""
@@ -428,7 +459,13 @@ class AeroCastTrayApp:
         self.hud_controller.signal_transferring.emit(filename, progress_pct, speed_mbps)
 
     def _handle_transfer_complete(self, filename: str, filepath: str):
-        """Emits success state to capsule HUD, plays audio chime."""
+        """Emits success state to capsule HUD, stops camera cleanly."""
+        self.gesture_engine.stop()
+        if self.network_service:
+            self.network_service.unstage_file()
+        self._staged_local_file = ""
+        self._active_incoming_meta = None
+
         self.hud_controller.signal_success.emit(filename)
         self._play_chime("drop.wav")
         if self.tray_icon:

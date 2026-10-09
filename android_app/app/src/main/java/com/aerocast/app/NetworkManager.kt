@@ -79,6 +79,7 @@ class NetworkManager(private val context: Context) {
     private var stagedFile: File? = null
     private var multicastLock: WifiManager.MulticastLock? = null
     private val bluetoothAdapter: BluetoothAdapter? by lazy { BluetoothAdapter.getDefaultAdapter() }
+    private val discoveredLaptops = java.util.concurrent.CopyOnWriteArraySet<String>()
 
     fun setListener(l: NetworkListener) {
         this.listener = l
@@ -89,6 +90,7 @@ class NetworkManager(private val context: Context) {
         isListening = true
         acquireMulticastLock()
         startUdpListener()
+        startDiscoveryLoop()
         startTcpServer()
         startBluetoothServer()
     }
@@ -175,7 +177,36 @@ class NetworkManager(private val context: Context) {
         return buf
     }
 
-    // ================= 1. UDP BEACON SIGNALING =================
+    // ================= 1. UDP BEACON SIGNALING & DISCOVERY =================
+    private fun startDiscoveryLoop() {
+        scope.launch {
+            while (isActive && isListening) {
+                try {
+                    val socket = DatagramSocket().apply { broadcast = true }
+                    val payload = JSONObject().apply {
+                        put("proto", "AEROCAST_V2_NATIVE")
+                        put("proto_v1", "AERO_CAST_V1")
+                        put("event", MSG_DISCOVERY_BEACON)
+                        put("sender", SENDER_MOBILE)
+                        put("device_name", android.os.Build.MODEL)
+                        put("sender_ip", getLocalIpAddress())
+                        put("tcp_port", TCP_TRANSFER_PORT)
+                    }.toString().toByteArray(Charsets.UTF_8)
+
+                    socket.send(DatagramPacket(payload, payload.size, getBroadcastAddress(), UDP_BEACON_PORT))
+                    socket.send(DatagramPacket(payload, payload.size, InetAddress.getByName("255.255.255.255"), UDP_BEACON_PORT))
+                    for (ip in discoveredLaptops) {
+                        try {
+                            socket.send(DatagramPacket(payload, payload.size, InetAddress.getByName(ip), UDP_BEACON_PORT))
+                        } catch (e: Exception) {}
+                    }
+                    socket.close()
+                } catch (e: Exception) {}
+                delay(3500)
+            }
+        }
+    }
+
     private fun startUdpListener() {
         scope.launch {
             try {
@@ -200,16 +231,25 @@ class NetworkManager(private val context: Context) {
                         val sender = json.optString("sender")
                         val event = json.optString("event")
 
+                        val hostAddr = packet.address.hostAddress
+                        if (!hostAddr.isNullOrBlank() && hostAddr != "127.0.0.1") {
+                            discoveredLaptops.add(hostAddr)
+                        }
+                        val declaredIp = json.optString("sender_ip")
+                        if (declaredIp.isNotBlank() && declaredIp != "127.0.0.1") {
+                            discoveredLaptops.add(declaredIp)
+                        }
+
                         // Discovery Beacon -> Reply with Discovery ACK
                         if (event == MSG_DISCOVERY_BEACON || event == "DISCOVERY") {
                             replyDiscoveryAck(packet.address)
                         }
 
                         // Respond to Laptop ARMED_DROP / STAGE_ARMED beacons
-                        if (sender == SENDER_LAPTOP && (event == MSG_STAGE_ARMED || event == EVENT_ARMED_DROP)) {
+                        if (sender != SENDER_MOBILE && (event == MSG_STAGE_ARMED || event == EVENT_ARMED_DROP || event == "STAGE_ARMED" || event == "ARMED_DROP")) {
                             val filename = json.optString("filename", "Unknown File")
                             val size = json.optLong("size", json.optLong("filesize", 0L))
-                            val senderIp = json.optString("sender_ip", packet.address.hostAddress ?: "")
+                            val senderIp = if (declaredIp.isNotBlank()) declaredIp else (hostAddr ?: "")
                             val tcpPort = json.optInt("tcp_port", TCP_TRANSFER_PORT)
 
                             mainHandler.post {
@@ -251,37 +291,49 @@ class NetworkManager(private val context: Context) {
         }
     }
 
+    fun unstageFile() {
+        this.stagedFile = null
+    }
+
     /**
-     * Broadcasts Stage Armed beacon simultaneously via UDP and Bluetooth RFCOMM fallback.
+     * Broadcasts Stage Armed beacon continuously via UDP and Bluetooth RFCOMM fallback.
      */
     fun broadcastArmedDropBeacon(file: File) {
         this.stagedFile = file
 
-        // 1. Primary Wi-Fi UDP Broadcast
+        // 1. Primary Wi-Fi UDP Broadcast (Continuous Loop until transfer completed or unstaged)
         scope.launch {
-            try {
-                val socket = DatagramSocket().apply { broadcast = true }
-                val payload = JSONObject().apply {
-                    put("proto", "AEROCAST_V2_NATIVE")
-                    put("proto_v1", "AERO_CAST_V1")
-                    put("event", MSG_STAGE_ARMED)
-                    put("sender", SENDER_MOBILE)
-                    put("device_name", android.os.Build.MODEL)
-                    put("sender_ip", getLocalIpAddress())
-                    put("tcp_port", TCP_TRANSFER_PORT)
-                    put("filename", file.name)
-                    put("size", file.length())
-                    put("filesize", file.length())
-                }.toString()
+            while (isActive && isListening && stagedFile == file) {
+                try {
+                    val socket = DatagramSocket().apply { broadcast = true }
+                    val payload = JSONObject().apply {
+                        put("proto", "AEROCAST_V2_NATIVE")
+                        put("proto_v1", "AERO_CAST_V1")
+                        put("event", MSG_STAGE_ARMED)
+                        put("sender", SENDER_MOBILE)
+                        put("device_name", android.os.Build.MODEL)
+                        put("sender_ip", getLocalIpAddress())
+                        put("tcp_port", TCP_TRANSFER_PORT)
+                        put("filename", file.name)
+                        put("size", file.length())
+                        put("filesize", file.length())
+                    }.toString()
 
-                val bytes = payload.toByteArray(Charsets.UTF_8)
-                val targetBcast = getBroadcastAddress()
-                socket.send(DatagramPacket(bytes, bytes.size, targetBcast, UDP_BEACON_PORT))
-                socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("255.255.255.255"), UDP_BEACON_PORT))
-                socket.close()
-                Log.d(TAG, "Broadcasted Mobile ARMED_DROP beacon over Wi-Fi for ${file.name}")
-            } catch (e: Exception) {
-                Log.e(TAG, "Failed to broadcast Wi-Fi beacon: ${e.message}")
+                    val bytes = payload.toByteArray(Charsets.UTF_8)
+                    val targetBcast = getBroadcastAddress()
+                    socket.send(DatagramPacket(bytes, bytes.size, targetBcast, UDP_BEACON_PORT))
+                    socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName("255.255.255.255"), UDP_BEACON_PORT))
+                    for (ip in discoveredLaptops) {
+                        try {
+                            socket.send(DatagramPacket(bytes, bytes.size, InetAddress.getByName(ip), UDP_BEACON_PORT))
+                        } catch (e: Exception) {}
+                    }
+                    socket.close()
+                    Log.d(TAG, "Broadcasted Mobile ARMED_DROP beacon over Wi-Fi for ${file.name}")
+                } catch (e: Exception) {
+                    Log.e(TAG, "Failed to broadcast Wi-Fi beacon: ${e.message}")
+                }
+                delay(1000)
             }
         }
 
@@ -425,6 +477,7 @@ class NetworkManager(private val context: Context) {
 
                         val ack = ByteArray(2)
                         input.readFully(ack)
+                        unstageFile()
                         mainHandler.post { listener?.onTransferComplete(fileToSend.name, fileToSend) }
                     }
                 }
@@ -513,6 +566,7 @@ class NetworkManager(private val context: Context) {
 
                         val ack = ByteArray(2)
                         input.readFully(ack)
+                        unstageFile()
                         mainHandler.post { listener?.onTransferComplete(fileToSend.name, fileToSend) }
                     }
                 } else {
@@ -547,6 +601,7 @@ class NetworkManager(private val context: Context) {
 
                     output.write("OK".toByteArray(Charsets.UTF_8))
                     output.flush()
+                    unstageFile()
                     mainHandler.post { listener?.onTransferComplete(filename, destFile) }
                 }
             } catch (e: Exception) {
@@ -621,6 +676,7 @@ class NetworkManager(private val context: Context) {
 
                 output.write("OK".toByteArray(Charsets.UTF_8))
                 output.flush()
+                unstageFile()
 
                 mainHandler.post { listener?.onTransferComplete(filename, destFile) }
                 success = true
@@ -699,6 +755,7 @@ class NetworkManager(private val context: Context) {
 
                 output.write("OK".toByteArray(Charsets.UTF_8))
                 output.flush()
+                unstageFile()
 
                 mainHandler.post { listener?.onTransferComplete(filename, destFile) }
                 return

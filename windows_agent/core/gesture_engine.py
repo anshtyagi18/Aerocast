@@ -200,7 +200,7 @@ class OnDemandGestureEngine:
     def start_watch(
         self,
         mode: str = "DROP",
-        timeout: float = GESTURE_TIMEOUT_SECONDS,
+        timeout: Optional[float] = None, # None = indefinite, runs until file transfer finishes or stopped
         on_gesture: Optional[Callable[[str], None]] = None,
         on_timeout: Optional[Callable[[], None]] = None,
         on_progress: Optional[Callable[[int, int, float], None]] = None,
@@ -236,17 +236,18 @@ class OnDemandGestureEngine:
                         time.sleep(0.015)
                         continue
 
-                    # CRITICAL FIX: Timer starts ONLY after camera has warmed up and returned first valid frame
+                    # Timer starts ONLY after camera has warmed up and returned first valid frame
                     if start_time is None:
                         start_time = time.time()
 
-                    elapsed = time.time() - start_time
-                    time_remaining = max(0.0, timeout - elapsed)
-
-                    if time_remaining <= 0:
-                        if on_timeout:
-                            on_timeout()
-                        break
+                    time_remaining = 999.0
+                    if timeout and timeout > 0:
+                        elapsed = time.time() - start_time
+                        time_remaining = max(0.0, timeout - elapsed)
+                        if time_remaining <= 0:
+                            if on_timeout:
+                                on_timeout()
+                            break
 
                     frame = cv2.flip(frame, 1)
                     rgb_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
@@ -312,7 +313,7 @@ try:
         def start_watch(
             self,
             mode: str = "DROP",
-            timeout: float = GESTURE_TIMEOUT_SECONDS,
+            timeout: Optional[float] = None,
             on_gesture: Optional[Callable[[str], None]] = None,
             on_timeout: Optional[Callable[[], None]] = None,
             on_progress: Optional[Callable[[int, int, float], None]] = None

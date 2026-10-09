@@ -35,6 +35,8 @@ class HUDController(QObject):
     signal_success = pyqtSignal(str)                    # filename
     signal_hide = pyqtSignal()
     signal_progress_dots = pyqtSignal(int, int)         # streak, required
+    signal_action_clicked = pyqtSignal()                # User clicked capsule to confirm action
+    signal_dismiss_clicked = pyqtSignal()               # User clicked close button
 
 
 class DynamicCapsuleHUD(QWidget):
@@ -59,7 +61,6 @@ class DynamicCapsuleHUD(QWidget):
         self.setWindowFlags(
             Qt.WindowType.FramelessWindowHint |
             Qt.WindowType.WindowStaysOnTopHint |
-            Qt.WindowType.SubWindow |
             Qt.WindowType.Tool
         )
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)
@@ -130,13 +131,24 @@ class DynamicCapsuleHUD(QWidget):
         layout.addLayout(text_layout, stretch=1)
 
         # Right pulse indicator / close button
-        self.pulse_label = QLabel("•••", self.container)
-        self.pulse_label.setStyleSheet("color: #38bdf8; font-size: 11px; font-weight: bold;")
+        self.pulse_label = QLabel("✕", self.container)
+        self.pulse_label.setStyleSheet("color: #94a3b8; font-size: 13px; font-weight: bold; padding: 4px;")
         self.pulse_label.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-        self.pulse_label.mousePressEvent = lambda e: self.slide_out()
+        self.pulse_label.mousePressEvent = self._on_dismiss_clicked
         layout.addWidget(self.pulse_label)
 
+        # Container click confirms action
+        self.container.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
+        self.container.mousePressEvent = self._on_container_clicked
+
         self._pulse_timer.timeout.connect(self._on_pulse_tick)
+
+    def _on_container_clicked(self, event):
+        self.controller.signal_action_clicked.emit()
+
+    def _on_dismiss_clicked(self, event):
+        self.controller.signal_dismiss_clicked.emit()
+        self.slide_out()
 
     def _connect_signals(self):
         self.controller.signal_armed_drop.connect(self.show_armed_drop)
@@ -194,12 +206,14 @@ class DynamicCapsuleHUD(QWidget):
         if streak > 0:
             self.pulse_label.setText(f"{streak}/{required}")
         else:
-            self.pulse_label.setText("•••")
+            self.pulse_label.setText("✕")
 
     def slide_in(self):
         x = self._center_x()
         self.move(x, self.hidden_y)
         self.show()
+        self.raise_()
+        self.activateWindow()
 
         if self._slide_anim:
             self._slide_anim.stop()
@@ -256,8 +270,8 @@ class DynamicCapsuleHUD(QWidget):
         self.icon_badge.setText("✊")
         self._apply_badge_style("#f59e0b", "rgba(245, 158, 11, 0.22)")
 
-        self.title_label.setText(f"✊ Grab to Cast: {display_name}")
-        self.sub_label.setText(f"Make Fist (✊) to Cast • {size_str}")
+        self.title_label.setText(f"✊ Grab or Click to Cast: {display_name}")
+        self.sub_label.setText(f"Make Fist (✊) or Click Here to Cast • {size_str}")
         self.progress_bar.hide()
         self.slide_in()
 
@@ -278,9 +292,9 @@ class DynamicCapsuleHUD(QWidget):
         self.icon_badge.setText("⚡")
         self._apply_badge_style("#38bdf8", "rgba(56, 189, 248, 0.25)")
 
-        self.title_label.setText("Staged! Finding Devices...")
+        self.title_label.setText("Staged! Broadcasting to Phone...")
         self.sub_label.setText("Broadcasting via Wi-Fi & Bluetooth...")
-        self.pulse_label.setText("•••")
+        self.pulse_label.setText("✕")
         self.progress_bar.hide()
         self._play_audio("grab.wav")
         self.slide_in()
@@ -308,7 +322,7 @@ class DynamicCapsuleHUD(QWidget):
         self._apply_badge_style("#c084fc", "rgba(168, 85, 247, 0.25)")
 
         self.title_label.setText(f"📥 Incoming: {display_name}")
-        self.sub_label.setText(f"✋ Show Palm to Drop • {size_str}")
+        self.sub_label.setText(f"✋ Show Palm (✋) or Click Here to Drop • {size_str}")
         self.progress_bar.hide()
         self._play_audio("grab.wav")
         self.slide_in()
