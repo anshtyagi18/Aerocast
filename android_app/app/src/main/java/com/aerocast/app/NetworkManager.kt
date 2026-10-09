@@ -477,7 +477,7 @@ class NetworkManager(private val context: Context) {
                         val startTime = System.currentTimeMillis()
 
                         FileInputStream(fileToSend).use { fis ->
-                            var read: Int
+                            var read = 0
                             while (fis.read(buffer).also { read = it } != -1) {
                                 output.write(buffer, 0, read)
                                 sentBytes += read
@@ -580,7 +580,7 @@ class NetworkManager(private val context: Context) {
                         val startTime = System.currentTimeMillis()
 
                         FileInputStream(fileToSend).use { fis ->
-                            var read: Int
+                            var read = 0
                             while (fis.read(buffer).also { read = it } != -1) {
                                 output.write(buffer, 0, read)
                                 sentBytes += read
@@ -648,7 +648,7 @@ class NetworkManager(private val context: Context) {
 
     private fun handleHttpStream(socket: Socket, rawIn: InputStream, out: OutputStream) {
         val headerBytes = ByteArrayOutputStream()
-        val matchPattern = byteArrayOf('\r'.code.toByte(), '\n'.code.toByte(), '\r'.code.toByte(), '\n'.code.toByte())
+        val matchPattern = byteArrayOf(13.toByte(), 10.toByte(), 13.toByte(), 10.toByte())
         var patternIdx = 0
 
         while (true) {
@@ -676,7 +676,7 @@ class NetworkManager(private val context: Context) {
         for (line in lines) {
             val colon = line.indexOf(":")
             if (colon != -1) {
-                val key = line.substring(0, colon).trim().lowercase()
+                val key = line.substring(0, colon).trim().lowercase(java.util.Locale.ROOT)
                 val value = line.substring(colon + 1).trim()
                 if (key == "content-length") {
                     contentLength = value.toLongOrNull() ?: 0L
@@ -705,7 +705,7 @@ class NetworkManager(private val context: Context) {
                 val startTime = System.currentTimeMillis()
 
                 FileInputStream(fileToSend).use { fis ->
-                    var read: Int
+                    var read = 0
                     while (fis.read(buffer).also { read = it } != -1) {
                         out.write(buffer, 0, read)
                         sentBytes += read
@@ -780,7 +780,7 @@ class NetworkManager(private val context: Context) {
                 conn.connect()
 
                 if (conn.responseCode == HttpURLConnection.HTTP_OK) {
-                    val totalSize = if (conn.contentLengthLong > 0) conn.contentLengthLong else expectedSize
+                    val totalSize = conn.getHeaderField("Content-Length")?.toLongOrNull() ?: expectedSize
                     val destDir = getSafeDownloadDir(context)
                     val destFile = File(destDir, filename)
 
@@ -790,7 +790,7 @@ class NetworkManager(private val context: Context) {
 
                     conn.inputStream.use { input ->
                         FileOutputStream(destFile).use { fos ->
-                            var count: Int
+                            var count = 0
                             while (input.read(buffer).also { count = it } != -1) {
                                 fos.write(buffer, 0, count)
                                 receivedBytes += count
