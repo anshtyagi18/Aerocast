@@ -489,11 +489,23 @@ class AeroCastTrayApp:
 def main():
     parser = argparse.ArgumentParser(description="AeroCast Silent Background Agent")
     parser.add_argument("--stage", type=str, help="Stage a file immediately for Air Send", default=None)
+    parser.add_argument("--force", action="store_true", help="Force start even if an instance is running")
     args = parser.parse_args()
 
     if args.stage:
         if send_ipc_file(args.stage):
             sys.exit(0)
+    elif not args.force:
+        # Check if already running in background tray
+        try:
+            s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+            s.settimeout(0.5)
+            s.connect(("127.0.0.1", IPC_LOCAL_PORT))
+            s.close()
+            print("[AeroCast] Agent is already running in the Windows system tray.")
+            sys.exit(0)
+        except Exception:
+            pass
 
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(False)

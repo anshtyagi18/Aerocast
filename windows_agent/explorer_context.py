@@ -39,11 +39,47 @@ def get_agent_paths():
     return py_exe, str(base_dir / "explorer_context.py"), str(icon_path), str(tray_script)
 
 
+AUTOSTART_REG_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
+def install_autostart() -> bool:
+    """
+    Registers AeroCast background tray agent into Windows Startup (HKCU Run key).
+    Causes AeroCast to start automatically & silently upon user login.
+    """
+    try:
+        py_exe, _, _, tray_script = get_agent_paths()
+        command_str = f'"{py_exe}" "{tray_script}"'
+        with winreg.CreateKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY) as key:
+            winreg.SetValueEx(key, "AeroCast", 0, winreg.REG_SZ, command_str)
+        print("[AeroCast] Windows startup auto-launch registered successfully.")
+        return True
+    except Exception as e:
+        print(f"[AeroCast] Error registering autostart: {e}", file=sys.stderr)
+        return False
+
+
+def uninstall_autostart() -> bool:
+    """Removes AeroCast from Windows Startup."""
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, AUTOSTART_REG_KEY, 0, winreg.KEY_SET_VALUE) as key:
+            winreg.DeleteValue(key, "AeroCast")
+        print("[AeroCast] Windows startup auto-launch unregistered.")
+        return True
+    except FileNotFoundError:
+        return True
+    except Exception as e:
+        print(f"[AeroCast] Error removing autostart: {e}", file=sys.stderr)
+        return False
+
+
 def install_context_menu() -> bool:
     """
-    Registers 'Air Send with AeroCast' into the Windows Registry under HKCU.
+    Registers 'Air Send with AeroCast' into the Windows Registry under HKCU
+    and registers AeroCast to run permanently at Windows startup.
     Does NOT require administrator privileges.
     """
+    success = True
     try:
         py_exe, context_script, icon_path, _ = get_agent_paths()
         command_str = f'"{py_exe}" "{context_script}" "%1"'
@@ -69,14 +105,20 @@ def install_context_menu() -> bool:
             winreg.SetValueEx(dir_cmd_key, "", 0, winreg.REG_SZ, command_str)
 
         print("[AeroCast] Explorer context menu registered successfully.")
-        return True
     except Exception as e:
         print(f"[AeroCast] Error installing context menu: {e}", file=sys.stderr)
-        return False
+        success = False
+
+    # Also install Windows Startup autostart
+    if not install_autostart():
+        success = False
+
+    return success
 
 
 def uninstall_context_menu() -> bool:
-    """Removes 'Air Send with AeroCast' from Windows Registry."""
+    """Removes 'Air Send with AeroCast' and startup autostart from Windows Registry."""
+    uninstall_autostart()
     try:
         # Delete file context menu keys
         try:

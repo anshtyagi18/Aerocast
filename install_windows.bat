@@ -51,17 +51,23 @@ if exist "windows_agent\assets\grab_ready.wav" (
     )
 )
 
-:: 5. Register Windows Explorer Right-Click Context Menu ("Air Send")
-echo [SETUP] Registering Air Send into Windows Explorer context menu...
+:: 5. Register Windows Explorer Right-Click Context Menu & Permanent Auto-Start
+echo [SETUP] Registering AeroCast into Windows Explorer & Windows Startup...
 python windows_agent\explorer_context.py --install
 
-:: 6. Launch Windows Background Tray Agent Silently
+:: 6. Configure Windows Firewall (UDP 42424 & TCP 42425)
+echo [SETUP] Ensuring Windows Firewall allows local communication...
+netsh advfirewall firewall add rule name="AeroCast UDP Signaling" dir=in action=allow protocol=UDP localport=42424 >nul 2>&1
+netsh advfirewall firewall add rule name="AeroCast TCP Transfer" dir=in action=allow protocol=TCP localport=42425 >nul 2>&1
+
+:: 7. Launch Windows Background Tray Agent Silently
 echo.
 echo ================================================================
 echo   AeroCast Native successfully installed and registered!
-echo   - Right-click any file in Explorer: Air Send via AeroCast
-echo   - Subnet Auto-Discovery: Listening on UDP 42424
-echo   - Launching System Tray Agent in background via pythonw...
+echo   - Permanent Auto-Start: Enabled (starts on Windows boot)
+echo   - Right-click any file in Explorer: "Air Send with AeroCast"
+echo   - Subnet Auto-Discovery: Listening on UDP 42424 / TCP 42425
+echo   - Background Tray Agent: Running silently via pythonw
 echo ================================================================
 echo.
 
